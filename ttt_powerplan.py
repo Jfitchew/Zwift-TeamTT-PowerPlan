@@ -595,33 +595,43 @@ if st.button("Compute max-speed plan"):
       ]
     )
 
-    st.subheader("Pull plan & rotation-average load")
-    st.dataframe(df_plan, use_container_width=True, hide_index=True)
+    # --- Add this block AFTER you compute: pulls, avgW, frac, and P ---
+    # (i.e., after: P = compute_power_matrix(...))
 
-    st.subheader("Power required by position at target speed")
-    st.dataframe(df_pos, use_container_width=True, hide_index=True)
-
-    st.subheader("Rotation timing (one full cycle)")
+    n = len(riders)
     T = pulls.sum()
-    timeline = []
-    t0 = 0.0
-    for k in range(len(riders)):
-        leader = riders[k].name
-        dt = pulls[k]
-        if dt <= 1e-9:
-            continue
-        timeline.append(
+
+    rows = []
+    for i, r in enumerate(riders):
+        t_front = pulls[i]
+        t_draft = max(0.0, T - t_front)
+
+        # Power when THIS rider is on the front (segment k=i -> rider i is position 1)
+        p_front = P[i, i]
+
+        # Time-weighted average drafting power (all segments where rider i is NOT the leader)
+        if t_draft > 1e-9:
+            draft_work = float(np.dot(pulls, P[i, :]) - t_front * p_front)  # sum_k t_k*P[i,k] excluding k=i
+            p_draft_avg = draft_work / t_draft
+        else:
+            p_draft_avg = 0.0
+
+        rows.append(
             {
-                "Segment": len(timeline) + 1,
-                "Leader (Pos1)": leader,
-                "Start_s": t0,
-                "End_s": t0 + dt,
-                "Duration_s": dt,
+                "Start_order": i + 1,
+                "Rider": r.name,
+                "Pull_s": int(round(t_front)),
+                "Pull_W": int(round(p_front)),
+                "DraftAvg_W": int(round(p_draft_avg)),
+                "Avg_W": int(round(avgW[i])),
+                "%FTP": int(round(100.0 * avgW[i] / r.ftp_w)),
             }
-        )
-        t0 += dt
-    df_time = pd.DataFrame(timeline)
-    st.dataframe(df_time, use_container_width=True, hide_index=True)
+    )
+
+    df_combined = pd.DataFrame(rows)
+
+    st.subheader("Combined rider plan (starting order)")
+    st.dataframe(df_combined, use_container_width=True, hide_index=True)
 
     # If infeasible, show who breaks the cap
     if not plan["feasible"]:
