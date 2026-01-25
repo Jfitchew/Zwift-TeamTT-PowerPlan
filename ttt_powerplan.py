@@ -459,8 +459,34 @@ for _, row in edited.iterrows():
         )
     )
 
-# Sort strongest->weakest (FTP desc). If tie, lower CdA first (more aero) then higher weight (minor).
-riders.sort(key=lambda r: (-r.ftp_w, r.cda_front, -r.weight_kg))
+# Sort strongest -> weakest using an estimated max sustainable flat speed proxy.
+# We compute the speed v such that required power on the front equals cap_fraction * FTP:
+#   P(v) = v*(m g Crr) + 0.5*rho*CdA*v^3  =  cap_fraction * FTP
+# Then sort by that v (higher v = "stronger" for TTT pace-setting).
+def solve_front_speed_mps(r, p_cap_w, crr, rho):
+    m = r.system_mass_kg
+    cda = r.cda_front
+    # Monotonic in v, so use a safe bisection.
+    lo, hi = 0.0, 30.0  # m/s upper bound is plenty
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        p = mid * (m * G * crr) + 0.5 * rho * cda * (mid ** 3)
+        if p < p_cap_w:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+# Use current model settings to order riders for best team speed on the front.
+# (Uses cap_fraction, crr, rho from the sidebar.)
+riders.sort(
+    key=lambda r: -solve_front_speed_mps(
+        r,
+        p_cap_w=float(cap_fraction) * r.ftp_w,
+        crr=float(crr),
+        rho=float(rho),
+    )
+)
 
 st.subheader("Sorted rider order (strongest → weakest)")
 df_order = pd.DataFrame(
