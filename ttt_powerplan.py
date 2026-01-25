@@ -558,21 +558,41 @@ if st.button("Compute max-speed plan"):
                 cda_eff=cda_eff,
             )
         pos_powers.append(row)
-    df_pos = pd.DataFrame(pos_powers)
+    df_pos = pd.DataFrame(
+      [
+        {
+            "Name": r.name,
+            "FTP_W": int(round(r.ftp_w)),
+            **{
+                f"Pos{pos}_W": int(round(
+                    power_required_w(
+                        v_mps=plan["v_mps"],
+                        mass_kg=r.system_mass_kg,
+                        crr=float(crr),
+                        rho=float(rho),
+                        cda_eff=r.cda_front * draft_factors[pos - 1],
+                    )
+                ))
+                for pos in range(1, len(riders) + 1)
+            },
+        }
+        for r in riders
+      ]
+    )
 
     df_plan = pd.DataFrame(
-        [
-            {
-                "Order": i + 1,
-                "Name": riders[i].name,
-                "Pull_s": pulls[i],
-                "Pull_share_%": 100.0 * pulls[i] / max(1e-9, pulls.sum()),
-                "Avg_W_over_rotation": avgW[i],
-                "Avg_%FTP": 100.0 * frac[i],
-                "FTP_W": riders[i].ftp_w,
-            }
-            for i in range(len(riders))
-        ]
+      [
+        {
+            "Order": i + 1,
+            "Name": riders[i].name,
+            "Pull_s": int(round(pulls[i])),
+            "Pull_share_%": int(round(100.0 * pulls[i] / max(1e-9, pulls.sum()))),
+            "Avg_W_over_rotation": int(round(avgW[i])),
+            "Avg_%FTP": int(round(100.0 * frac[i])),
+            "FTP_W": int(round(riders[i].ftp_w)),
+        }
+        for i in range(len(riders))
+      ]
     )
 
     st.subheader("Pull plan & rotation-average load")
