@@ -54,13 +54,13 @@ def power_required_w(v_mps: float, mass_kg: float, crr: float, rho: float, cda_e
 def build_default_draft_factors(n_riders: int) -> List[float]:
     """
     Draft factors per position (CdA multiplier):
-      pos1=1.00, pos2=0.75, pos3=0.70, pos4=0.67
-    For n>4 we cap at 0.67 for deeper positions by default.
+      pos1=1.00, pos2=0.74, pos3=0.63, pos4=0.60
+    For n>4 we cap at 0.58 for deeper positions by default.
     """
-    base = [1.00, 0.75, 0.70, 0.67]
+    base = [1.00, 0.74, 0.63, 0.670]
     if n_riders <= 4:
         return base[:n_riders]
-    return base + [0.67] * (n_riders - 4)
+    return base + [0.58] * (n_riders - 4)
 
 
 # =============================
@@ -73,7 +73,7 @@ class Rider:
     height_cm: float
     ftp_w: float
     bike_kg: float = 8.0
-    cd: float = 0.69
+    cd: float = 0.77
 
     @property
     def system_mass_kg(self) -> float:
