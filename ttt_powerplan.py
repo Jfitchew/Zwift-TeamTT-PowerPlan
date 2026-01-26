@@ -509,9 +509,15 @@ def build_position_power_table(riders: List[Rider], v_mps: float, crr: float, rh
         rows.append(row)
     return pd.DataFrame(rows)
 
-def plan_table_png(df: pd.DataFrame, font_size: int = 14) -> bytes:
-    """Render the presentation 'card' table to PNG bytes."""
-    # Column colour palette (approximate to your example)
+def plan_table_png(df: pd.DataFrame, font_size: int = 16) -> bytes:
+    """
+    Render the presentation 'card' table to PNG bytes.
+
+    Key goals:
+      - generous spacing (avoid 'squashed' look)
+      - column widths proportional to text length
+      - bold, colored columns like your example
+    """
     col_colors = {
         "Rider Order": "#000000",          # black
         "Front Interval": "#D11B1B",       # red
@@ -521,13 +527,31 @@ def plan_table_png(df: pd.DataFrame, font_size: int = 14) -> bytes:
         "wkg ": "#1E73D8",                 # blue (note trailing space for second wkg col label)
         "Overall": "#7A3DB8",              # purple
         "NP % FTP": "#7A3DB8",             # purple
+        "XP % FTP": "#7A3DB8",             # purple (if you switch to XP)
     }
 
     cols = list(df.columns)
     nrows, ncols = df.shape
 
-    fig_w = max(8.0, 1.2 * ncols)
-    fig_h = max(2.0, 0.65 + 0.50 * (nrows + 1))
+    # --- Column widths: proportional to max character count in each column (header included)
+    max_chars = []
+    for c in cols:
+        series = df[c].astype(str)
+        mc = max([len(str(c))] + [len(x) for x in series.tolist()])
+        max_chars.append(mc)
+
+    max_chars = np.array(max_chars, dtype=float)
+    # Give a little extra breathing room
+    max_chars = max_chars * 1.10
+    col_widths = (max_chars / max_chars.sum()).tolist()
+
+    # --- Figure sizing: make it wide enough and tall enough for large fonts
+    # Width: scale with "text mass" not just number of columns.
+    text_mass = float(max_chars.sum())
+    fig_w = max(12.0, min(28.0, 0.42 * text_mass))  # inches
+    # Height: header + rows; keep generous spacing.
+    fig_h = max(3.8, 1.2 + 0.75 * (nrows + 1))       # inches
+
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=200)
     ax.axis("off")
 
@@ -537,25 +561,37 @@ def plan_table_png(df: pd.DataFrame, font_size: int = 14) -> bytes:
         loc="center",
         cellLoc="center",
         colLoc="center",
+        colWidths=col_widths,
     )
+
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(font_size)
 
+    # Scale table: x for width, y for row height
+    tbl.scale(1.15, 1.55)
+
+    # Styling
     for (r, c), cell in tbl.get_celld().items():
         cell.set_edgecolor("#000000")
-        cell.set_linewidth(1.2)
+        cell.set_linewidth(1.6)
         cell.set_facecolor("#FFFFFF")
-        if r == 0:
-            cell.get_text().set_weight("bold")
-        else:
-            cell.get_text().set_weight("bold")
+        cell.PAD = 0.08  # internal padding
 
-        # Header text colour and body text colour per column
         col_name = cols[c]
-        cell.get_text().set_color(col_colors.get(col_name, "#000000"))
+        color = col_colors.get(col_name)
+        if color is None:
+            if str(col_name).startswith("Overall"):
+                color = "#7A3DB8"
+            elif str(col_name).endswith("% FTP"):
+                color = "#7A3DB8"
+        cell.get_text().set_color(color or "#000000")
+        cell.get_text().set_weight("bold")
+
+        if r == 0:  # header row
+            cell.set_linewidth(1.8)
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.25)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
