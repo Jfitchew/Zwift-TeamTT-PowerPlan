@@ -510,52 +510,71 @@ def build_position_power_table(riders: List[Rider], v_mps: float, crr: float, rh
         rows.append(row)
     return pd.DataFrame(rows)
 
-def plan_table_png(df: pd.DataFrame, font_size: int = 16) -> bytes:
+def plan_table_png(df: pd.DataFrame, font_size: int = 18) -> bytes:
     """
-    Render the presentation 'card' table to PNG bytes.
-
-    Key goals:
-      - generous spacing (avoid 'squashed' look)
-      - column widths proportional to text length
-      - bold, colored columns like your example
+    Render the presentation 'card' table to PNG bytes with:
+      - wide, readable layout (no squashing)
+      - 2-line headers (provided via \n in df.columns)
+      - per-column coloured text (Front=red, Draft=blue, Overall/%FTP=purple)
+      - generous header height so wrapped titles don't collide
+    Returns PNG bytes suitable for st.download_button(...).
     """
-    col_colors = {
-        "Rider\nOrder": "#000000",         # black
-        "Front\nInterval": "#D11B1B",      # red
-        "Front\nPower": "#D11B1B",         # red
-        "Front\nwkg": "#D11B1B",           # red
-        "Drafting\nAvg Power": "#1E73D8",  # blue
-        "Drafting\nwkg": "#1E73D8",        # blue
-    }
-
+    # Colour palette (approx to your reference)
+    RED = "#D11B1B"
+    BLUE = "#1E73D8"
+    PURPLE = "#7A3DB8"
+    BLACK = "#000000"
 
     cols = list(df.columns)
     nrows, ncols = df.shape
 
-    # --- Column widths: proportional to max character count in each column (header included)
+    def _clean(s: str) -> str:
+        return str(s).replace("\n", " ").strip().lower()
+
+    def _col_color(col: str) -> str:
+        c = _clean(col)
+        if c.startswith("rider"):
+            return BLACK
+        if c.startswith("front"):
+            return RED
+        if c.startswith("draft"):
+            return BLUE
+        if c.startswith("overall") or ("% ftp" in c):
+            return PURPLE
+        return BLACK
+
+    # Compute relative column widths from max text length (header + body), but keep sane limits.
     def _max_line_len(s: str) -> int:
         parts = str(s).split("\n")
         return max(len(p) for p in parts) if parts else len(str(s))
 
     max_chars = []
     for c in cols:
-        series = df[c].astype(str)
-        mc = max([_max_line_len(c)] + [_max_line_len(x) for x in series.tolist()])
+        header_len = _max_line_len(c)
+        body_lens = [_max_line_len(x) for x in df[c].astype(str).tolist()]
+        mc = max([header_len] + body_lens)
         max_chars.append(mc)
 
     max_chars = np.array(max_chars, dtype=float)
-    # Give a little extra breathing room
-    max_chars = max_chars * 1.10
+
+    # Bias certain columns wider (names + interval strings)
+    for idx, c in enumerate(cols):
+        cc = _clean(c)
+        if cc.startswith("rider"):
+            max_chars[idx] *= 1.35
+        if "interval" in cc:
+            max_chars[idx] *= 1.15
+
+    # Add breathing room and clamp extremes
+    max_chars = np.clip(max_chars * 1.15, 6.0, 40.0)
     col_widths = (max_chars / max_chars.sum()).tolist()
 
-    # --- Figure sizing: make it wide enough and tall enough for large fonts
-    # Width: scale with "text mass" not just number of columns.
-    text_mass = float(max_chars.sum())
-    fig_w = max(12.0, min(28.0, 0.42 * text_mass))  # inches
-    # Height: header + rows; keep generous spacing.
-    fig_h = max(3.8, 1.2 + 0.75 * (nrows + 1))       # inches
+    # Figure sizing: scale with content and font size
+    # Wider than before and taller header area.
+    fig_w = max(14.0, min(32.0, 0.55 * float(max_chars.sum())))
+    fig_h = max(4.2, 1.4 + 0.72 * (nrows + 1))
 
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=200)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=220)
     ax.axis("off")
 
     tbl = ax.table(
@@ -570,44 +589,36 @@ def plan_table_png(df: pd.DataFrame, font_size: int = 16) -> bytes:
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(font_size)
 
-    # Scale table: x for width, y for row height
-    tbl.scale(1.15, 1.55)
+    # Global scaling: x slightly, y more for row height
+    tbl.scale(1.08, 1.85)
 
-    # Styling
+    # Style cells
     for (r, c), cell in tbl.get_celld().items():
         cell.set_edgecolor("#000000")
-        cell.set_linewidth(1.6)
         cell.set_facecolor("#FFFFFF")
-        cell.PAD = 0.08  # internal padding
+        cell.set_linewidth(1.6)
+        cell.PAD = 0.14  # padding inside cells
 
-        col_name = cols[c]
-        color = col_colors.get(col_name)
-        if color is None:
-            if str(col_name).startswith("Overall"):
-                color = "#7A3DB8"
-            elif str(col_name).endswith("% FTP"):
-                color = "#7A3DB8"
-        cell.get_text().set_color(color or "#000000")
+        # Set text styling
+        col_name = cols[c] if c < len(cols) else ""
+        color = _col_color(col_name)
+        cell.get_text().set_color(color)
         cell.get_text().set_weight("bold")
+        cell.get_text().set_va("center")
+        cell.get_text().set_ha("center")
 
-        if r == 0:  # header row
-            cell.set_linewidth(1.8)
+        # Header row: make it taller and a touch thicker border
+        if r == 0:
+            cell.set_linewidth(1.9)
+            # Increase header height relative to body rows
+            cell.set_height(cell.get_height() * 1.55)
 
+    # Save with extra padding to avoid clipping
     buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.25)
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.45)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
-
-
-
-# =============================
-# Local SQLite rider database
-# =============================
-
-# =============================
-# Local database (SQLite)
-# =============================
 def db_path() -> Path:
     # Local to the script directory for portability.
     return Path(__file__).with_name("ttt_riders.sqlite3")
