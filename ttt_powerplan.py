@@ -468,11 +468,8 @@ def init_db() -> None:
                 default_bike_id INTEGER,
                 FOREIGN KEY(default_bike_id) REFERENCES bikes(id) ON DELETE SET NULL
             )
-            REFERENCES bikes(id) ON DELETE SET NULL
-            )
             """
         )
-
         # Migration: if riders table has legacy columns bike_kg and cd, migrate to bikes table.
         cols = _table_columns(conn, "riders")
         if ("bike_kg" in cols) or ("cd" in cols):
@@ -492,8 +489,6 @@ def init_db() -> None:
                     zwiftpower_url TEXT,
                     default_bike_id INTEGER,
                     FOREIGN KEY(default_bike_id) REFERENCES bikes(id) ON DELETE SET NULL
-                )
-                ON DELETE SET NULL
                 )
                 """
             )
