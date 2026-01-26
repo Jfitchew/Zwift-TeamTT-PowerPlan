@@ -469,6 +469,7 @@ def build_combined_results_table(riders: List[Rider], pulls: np.ndarray, P: np.n
       - %FTP
     Displayed as whole numbers.
     """
+    effort_key = {'NP':'NP','XP':'XP','Average':'AVG'}.get(effort_method, (effort_method or 'EFF').upper())
     n = len(riders)
     T = float(pulls.sum())
     rows = []
@@ -491,8 +492,8 @@ def build_combined_results_table(riders: List[Rider], pulls: np.ndarray, P: np.n
                 "Pull_W": int(round(p_front)),
                 "DraftAvg_W": int(round(p_draft_avg)),
                 "Avg_W": int(round(float(avgW[i]))),
-                f"{(effort_method or 'Effort').upper()}_W": int(round(float(effortW[i]))),
-                f"{(effort_method or 'Effort').upper()}_%FTP": round(100.0 * float(effortW[i]) / float(r.ftp_w), 1),
+                f"{effort_key}_W": int(round(float(effortW[i]))),
+                f"{effort_key}_%FTP": round(100.0 * float(effortW[i]) / float(r.ftp_w), 1),
             }
         )
     return pd.DataFrame(rows)
@@ -519,25 +520,27 @@ def plan_table_png(df: pd.DataFrame, font_size: int = 16) -> bytes:
       - bold, colored columns like your example
     """
     col_colors = {
-        "Rider Order": "#000000",          # black
-        "Front Interval": "#D11B1B",       # red
-        "Front Power": "#D11B1B",          # red
-        "wkg": "#D11B1B",                  # red
-        "Drafting Avg Power": "#1E73D8",   # blue
-        "wkg ": "#1E73D8",                 # blue (note trailing space for second wkg col label)
-        "Overall": "#7A3DB8",              # purple
-        "NP % FTP": "#7A3DB8",             # purple
-        "XP % FTP": "#7A3DB8",             # purple (if you switch to XP)
+        "Rider\nOrder": "#000000",         # black
+        "Front\nInterval": "#D11B1B",      # red
+        "Front\nPower": "#D11B1B",         # red
+        "Front\nwkg": "#D11B1B",           # red
+        "Drafting\nAvg Power": "#1E73D8",  # blue
+        "Drafting\nwkg": "#1E73D8",        # blue
     }
+
 
     cols = list(df.columns)
     nrows, ncols = df.shape
 
     # --- Column widths: proportional to max character count in each column (header included)
+    def _max_line_len(s: str) -> int:
+        parts = str(s).split("\n")
+        return max(len(p) for p in parts) if parts else len(str(s))
+
     max_chars = []
     for c in cols:
         series = df[c].astype(str)
-        mc = max([len(str(c))] + [len(x) for x in series.tolist()])
+        mc = max([_max_line_len(c)] + [_max_line_len(x) for x in series.tolist()])
         max_chars.append(mc)
 
     max_chars = np.array(max_chars, dtype=float)
@@ -1435,18 +1438,20 @@ with tabs[0]:
     if effort_col_w is None or effort_col_pct is None:
         st.warning("Card export unavailable: could not find effort columns in the combined table.")
     else:
+        effort_method_label = {"NP":"NP","XP":"XP","Average":"Avg"}.get(effort_method, str(effort_method))
         df_card = pd.DataFrame({
             "Rider\nOrder": df_for_card["Rider"].astype(str),
             "Front\nInterval": df_for_card["Pull_s"].astype(int).astype(str) + " secs",
             "Front\nPower": df_for_card["Pull_W"].astype(int),
             "Front\nwkg": (df_for_card["Pull_W"].astype(float) / np.maximum(1e-9, np.array([r.weight_kg for r in riders], dtype=float))).round(1),
             "Drafting\nAvg Power": df_for_card["DraftAvg_W"].astype(int),
-            "Draft\nwkg ": (df_for_card["DraftAvg_W"].astype(float) / np.maximum(1e-9, np.array([r.weight_kg for r in riders], dtype=float))).round(1),
-            "Overall": df_for_card[effort_col_w].astype(int),
-            "NP\n% FTP": df_for_card[effort_col_pct].astype(float).round(1),
+            "Drafting\nwkg": (df_for_card["DraftAvg_W"].astype(float) / np.maximum(1e-9, np.array([r.weight_kg for r in riders], dtype=float))).round(1),
+            f"Overall\n{effort_method_label} Power": df_for_card[effort_col_w].astype(int),
+            f"{effort_method_label}\n% FTP": df_for_card[effort_col_pct].astype(float).round(1),
         })
 
         png_bytes = plan_table_png(df_card)
+
         st.image(png_bytes, use_container_width=True)
         st.download_button(
             "Download power plan card (PNG)",
