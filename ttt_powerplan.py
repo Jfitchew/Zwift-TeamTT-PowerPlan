@@ -17,6 +17,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
+from io import BytesIO
+import matplotlib.pyplot as plt
 
 G = 9.80665
 
@@ -507,7 +509,79 @@ def build_position_power_table(riders: List[Rider], v_mps: float, crr: float, rh
         rows.append(row)
     return pd.DataFrame(rows)
 
+def plan_table_png(
+    df: pd.DataFrame,
+    title: str = "",
+    font_size: int = 14,
+    row_height: float = 0.50,
+    header_height: float = 0.60,
+) -> bytes:
+    """
+    Render a DataFrame to a PNG image using matplotlib, with per-column colours similar to your example.
+    Returns PNG bytes for st.download_button.
+    """
 
+    # Column colour palette (approximate to your screenshot)
+    col_colors = {
+        "Rider Order": "#000000",         # black
+        "Front Interval": "#D11B1B",      # red
+        "Front Power": "#D11B1B",         # red
+        "wkg (Front)": "#D11B1B",         # red
+        "Drafting Avg Power": "#1E73D8",  # blue
+        "wkg (Draft)": "#1E73D8",         # blue
+        "Overall NP Pow": "#7A3DB8",      # purple
+        "NP % FTP": "#7A3DB8",            # purple
+    }
+
+    cols = list(df.columns)
+    nrows, ncols = df.shape
+
+    # Figure size heuristic
+    fig_w = max(8.0, 1.35 * ncols)
+    fig_h = header_height + row_height * max(1, nrows)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=200)
+    ax.axis("off")
+
+    # Create table
+    tbl = ax.table(
+        cellText=df.values,
+        colLabels=cols,
+        loc="center",
+        cellLoc="center",
+        colLoc="center",
+    )
+
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(font_size)
+
+    # Style cells
+    for (r, c), cell in tbl.get_celld().items():
+        cell.set_edgecolor("#000000")
+        cell.set_linewidth(1.2)
+
+        # Header row
+        if r == 0:
+            cell.set_facecolor("#FFFFFF")
+            cell.get_text().set_weight("bold")
+            cell.get_text().set_color(col_colors.get(cols[c], "#000000"))
+            cell.set_height(header_height / fig_h)
+        else:
+            cell.set_facecolor("#FFFFFF")
+            cell.get_text().set_weight("bold")
+            cell.get_text().set_color(col_colors.get(cols[c], "#000000"))
+            cell.set_height(row_height / fig_h)
+
+    # Optional title
+    if title:
+        ax.set_title(title, fontsize=font_size + 2, fontweight="bold", pad=12)
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+    
 # =============================
 # Local SQLite rider database
 # =============================
@@ -1360,6 +1434,62 @@ with tabs[0]:
         st.subheader("Combined rider plan (after manual pull edits)")
         st.dataframe(st.session_state["combined_table"], use_container_width=True, hide_index=True)
 
+    # --- Presentation table (matches your screenshot layout) ---
+
+    # Choose the metric label depending on mode
+    metric_label = "NP"  # or "XP" if you selected XP
+    # If your app has a variable, use it:
+    # metric_label = effort_method  # e.g. "NP" / "XP" / "AVG"
+
+    rows = []
+    for i, r in enumerate(riders):
+        ftp = float(r.ftp_w)
+
+        # You should already have these arrays from your computation:
+        # pulls[i], front_power[i], draft_avg_power[i], metric_power[i]
+        front_s = float(pulls[i])
+        front_w = float(front_power[i])
+        draft_w = float(draft_avg_power[i])
+        overall_metric_w = float(metric_power[i])  # NP/XP (or Avg if chosen)
+
+        rows.append({
+            "Rider Order": getattr(r, "short_name", None) or r.name,
+            "Front Interval": f"{int(round(front_s))} secs",
+            "Front Power": int(round(front_w)),
+            "wkg (Front)": round(front_w / max(1e-9, r.weight_kg), 1),
+            "Drafting Avg Power": int(round(draft_w)),
+            "wkg (Draft)": round(draft_w / max(1e-9, r.weight_kg), 1),
+            f"Overall {metric_label} Pow": int(round(overall_metric_w)),
+            f"{metric_label} % FTP": round(100.0 * overall_metric_w / max(1e-9, ftp), 1),
+        })
+
+    df_card = pd.DataFrame(rows)
+
+    st.subheader("Final Power Plan (presentation)")
+    st.caption(f"Target speed: {v_kph:.1f} km/h")
+
+    # Show as a normal Streamlit table too (numeric, sortable)
+    st.dataframe(df_card, use_container_width=True, hide_index=True)
+
+    # Export as PNG in your preferred “card” style
+    png_bytes = plan_table_png(df_card, title="")
+    st.image(png_bytes, caption="Power plan card", use_container_width=True)
+
+    st.download_button(
+        "Download power plan card (PNG)",
+        data=png_bytes,
+        file_name="ttt_power_plan.png",
+        mime="image/png",
+    )
+
+    # Optional: also export the underlying table
+    st.download_button(
+        "Download power plan table (CSV)",
+        data=df_card.to_csv(index=False).encode("utf-8"),
+        file_name="ttt_power_plan.csv",
+        mime="text/csv",
+    )
+    
     st.subheader("Power required by position (whole numbers)")
     df_pos = build_position_power_table(riders, plan["v_mps"], float(crr), float(rho), draft_factors)
     st.dataframe(df_pos, use_container_width=True, hide_index=True)
