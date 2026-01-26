@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import io
 from dataclasses import dataclass
@@ -119,6 +120,95 @@ def avg_power_for_pulls(P: np.ndarray, pulls_s: np.ndarray) -> np.ndarray:
     return (P @ pulls_s) / T
 
 
+
+# =============================
+# Effort metrics (Average / NP / XP)
+# =============================
+def compute_np_w(power_w: np.ndarray, window_s: int = 30) -> float:
+    """TrainingPeaks-style Normalized Power (NP): 30 s rolling average, 4th-power mean."""
+    p = np.asarray(power_w, dtype=float)
+    if p.size == 0:
+        return 0.0
+    w = int(window_s)
+    if p.size < w:
+        # If shorter than window, NP collapses to mean power
+        return float(p.mean())
+
+    # Pad start to avoid dropping early samples (simple, stable for periodic series)
+    pad = np.full(w - 1, p[0], dtype=float)
+    pp = np.concatenate([pad, p])
+
+    c = np.cumsum(pp)
+    roll = (c[w:] - c[:-w]) / w  # length == p.size
+    return float(np.mean(roll**4) ** 0.25)
+
+
+def compute_xp_w(power_w: np.ndarray, tau_s: float = 25.0) -> float:
+    """Skiba/TrainingPeaks-style xPower (XP): EWMA with ~25 s time constant, 4th-power mean."""
+    p = np.asarray(power_w, dtype=float)
+    if p.size == 0:
+        return 0.0
+    if p.size == 1:
+        return float(p[0])
+
+    # 1 Hz sample
+    alpha = 1.0 - math.exp(-1.0 / float(tau_s))
+    ew = np.empty_like(p, dtype=float)
+    ew[0] = p[0]
+    for i in range(1, p.size):
+        ew[i] = ew[i - 1] + alpha * (p[i] - ew[i - 1])
+
+    return float(np.mean(ew**4) ** 0.25)
+
+
+def build_cycle_power_series_1hz(P_row: np.ndarray, pulls_s: np.ndarray) -> np.ndarray:
+    """Piecewise-constant power series (1 Hz) for one full rotation."""
+    parts = []
+    for k in range(len(pulls_s)):
+        dur = int(round(float(pulls_s[k])))
+        if dur <= 0:
+            continue
+        parts.append(np.full(dur, float(P_row[k]), dtype=float))
+    if not parts:
+        return np.zeros(0, dtype=float)
+    return np.concatenate(parts)
+
+
+def compute_effort_w_for_pulls(P: np.ndarray, pulls_s: np.ndarray, method: str) -> np.ndarray:
+    """Return per-rider effort metric over a periodic rotation: Average / NP / XP."""
+    method = (method or "Average").strip().upper()
+    n = P.shape[0]
+    out = np.zeros(n, dtype=float)
+
+    # Use a periodic repetition to reduce boundary effects of NP/XP smoothing filters.
+    # (Much faster than simulating a full hour and accurate for steady rotating TTT pacing.)
+    for i in range(n):
+        cycle = build_cycle_power_series_1hz(P[i, :], pulls_s)
+        if cycle.size == 0:
+            out[i] = 0.0
+            continue
+
+        if method == "AVERAGE":
+            out[i] = float(cycle.mean())
+            continue
+
+        # Repeat enough to warm up filters and capture steady-state
+        L = cycle.size
+        reps = max(8, int(math.ceil(240.0 / L)) + 2)  # at least ~4 min total
+        series = np.tile(cycle, reps)
+        warm = min(series.size - 1, 2 * L)  # discard first 2 cycles
+
+        s = series[warm:]
+        if method == "NP":
+            out[i] = compute_np_w(s, window_s=30)
+        elif method in ("XP", "XPOWER"):
+            out[i] = compute_xp_w(s, tau_s=25.0)
+        else:
+            # Fallback
+            out[i] = float(cycle.mean())
+
+    return out
+
 # =============================
 # Ordering rule: strongest -> weakest
 # =============================
@@ -158,6 +248,7 @@ def try_find_feasible_pulls(
     crr: float,
     rho: float,
     draft_factors: List[float],
+    effort_method: str,
     cap_fraction: float,
     strongest_pull_bounds: Tuple[float, float],
     other_pull_max_s: float,
@@ -204,23 +295,23 @@ def try_find_feasible_pulls(
         return False, pulls, np.zeros(n), np.zeros(n)
 
     for _ in range(max_iters):
-        avgW = avg_power_for_pulls(P, pulls)
-        viol = avgW - caps
+        effortW = compute_effort_w_for_pulls(P, pulls, effort_method)
+        viol = effortW - caps
         if np.all(viol <= 1e-6):
-            return True, pulls, avgW, avgW / ftps
+            return True, pulls, effortW, effortW / ftps
 
         i_bad = int(np.argmax(viol))
         min_allowed = strongest_pull_bounds[0] if i_bad == 0 else tmin
         if pulls[i_bad] <= min_allowed + 1e-9:
-            return False, pulls, avgW, avgW / ftps
+            return False, pulls, effortW, effortW / ftps
 
         delta = min(2.0, pulls[i_bad] - min_allowed)  # seconds
         pulls[i_bad] -= delta
         clamp(i_bad)
 
         # Recompute slack, then assign delta to best receiver.
-        avgW2 = avg_power_for_pulls(P, pulls)
-        frac2 = avgW2 / ftps
+        effortW2 = compute_effort_w_for_pulls(P, pulls, effort_method)
+        frac2 = effortW2 / ftps
         slack = cap_fraction - frac2
 
         candidates = []
@@ -233,14 +324,14 @@ def try_find_feasible_pulls(
                 candidates.append((slack[j] * (ftps[j] / ftps.max()), j))
 
         if not candidates:
-            return False, pulls, avgW2, frac2
+            return False, pulls, effortW2, frac2
 
         _, j_best = max(candidates, key=lambda x: x[0])
         pulls[j_best] += delta
         clamp(j_best)
 
-    avgW = avg_power_for_pulls(P, pulls)
-    return bool(np.all(avgW <= caps + 1e-3)), pulls, avgW, avgW / ftps
+    effortW = compute_effort_w_for_pulls(P, pulls, effort_method)
+    return bool(np.all(effortW <= caps + 1e-3)), pulls, effortW, effortW / ftps
 
 
 def search_max_speed_plan(
@@ -248,6 +339,7 @@ def search_max_speed_plan(
     crr: float,
     rho: float,
     draft_factors: List[float],
+    effort_method: str,
     cap_fraction: float,
     strongest_pull_bounds: Tuple[float, float],
     other_pull_max_s: float,
@@ -273,6 +365,7 @@ def search_max_speed_plan(
             crr=crr,
             rho=rho,
             draft_factors=draft_factors,
+            effort_method=effort_method,
             cap_fraction=cap_fraction,
             strongest_pull_bounds=strongest_pull_bounds,
             other_pull_max_s=other_pull_max_s,
@@ -295,6 +388,7 @@ def search_max_speed_plan(
             crr=crr,
             rho=rho,
             draft_factors=draft_factors,
+            effort_method=effort_method,
             cap_fraction=cap_fraction,
             strongest_pull_bounds=strongest_pull_bounds,
             other_pull_max_s=other_pull_max_s,
@@ -336,6 +430,7 @@ def search_max_speed_plan(
             crr=crr,
             rho=rho,
             draft_factors=draft_factors,
+            effort_method=effort_method,
             cap_fraction=cap_fraction,
             strongest_pull_bounds=strongest_pull_bounds,
             other_pull_max_s=other_pull_max_s,
@@ -362,7 +457,7 @@ def search_max_speed_plan(
 # =============================
 # Results table helpers
 # =============================
-def build_combined_results_table(riders: List[Rider], pulls: np.ndarray, P: np.ndarray, avgW: np.ndarray) -> pd.DataFrame:
+def build_combined_results_table(riders: List[Rider], pulls: np.ndarray, P: np.ndarray, avgW: np.ndarray, effortW: np.ndarray, effort_method: str) -> pd.DataFrame:
     """
     Combined table (starting order):
       - Pull time
@@ -394,7 +489,8 @@ def build_combined_results_table(riders: List[Rider], pulls: np.ndarray, P: np.n
                 "Pull_W": int(round(p_front)),
                 "DraftAvg_W": int(round(p_draft_avg)),
                 "Avg_W": int(round(float(avgW[i]))),
-                "%FTP": int(round(100.0 * float(avgW[i]) / float(r.ftp_w))),
+                f"{(effort_method or 'Effort').upper()}_W": int(round(float(effortW[i]))),
+                f"{(effort_method or 'Effort').upper()}_%FTP": round(100.0 * float(effortW[i]) / float(r.ftp_w), 1),
             }
         )
     return pd.DataFrame(rows)
@@ -1050,10 +1146,11 @@ with tabs[0]:
     with st.sidebar:
         st.subheader("Environment / Model")
         crr = st.number_input("CRR", value=0.004, step=0.0005, format="%.4f")
-        rho = st.number_input("Air density Ï (kg/mÂ³)", value=1.214, step=0.01, format="%.3f")
+        rho = st.number_input("Air density ÃÂ (kg/mÃÂ³)", value=1.214, step=0.01, format="%.3f")
 
         st.subheader("Constraints")
-        cap_fraction = st.slider("Average cap (%FTP)", min_value=0.70, max_value=1.05, value=0.97, step=0.01)
+        effort_method = st.selectbox("Effort metric (constraint & reporting)", ["NP", "XP", "Average"], index=0)
+        cap_fraction = st.slider(f"Target {effort_method} (%FTP)", min_value=0.70, max_value=1.05, value=0.99, step=0.01)
 
         st.subheader("Pull time bounds (solver)")
         strongest_min = st.number_input("Strongest min pull (s)", value=60.0, step=5.0)
@@ -1083,7 +1180,7 @@ with tabs[0]:
 
     st.subheader("Select riders for this plan")
     selected_names = st.multiselect(
-        "Pick riders (4â8). You can edit values temporarily below before solving.",
+        "Pick riders (4Ã¢ÂÂ8). You can edit values temporarily below before solving.",
         options=riders_df["name"].tolist(),
         default=riders_df["name"].tolist()[:4],
     )
@@ -1153,7 +1250,7 @@ with tabs[0]:
     sel_edit["__order_score_v"] = sel_edit.apply(_solve_front_speed_mps, axis=1)
     sel_edit = sel_edit.sort_values("__order_score_v", ascending=False).drop(columns="__order_score_v").reset_index(drop=True)
 
-    st.caption("Rider order is enforced strongest â weakest (based on cap-speed proxy using FTP, CdA, and mass).")
+    st.caption("Rider order is enforced strongest Ã¢ÂÂ weakest (based on cap-speed proxy using FTP, CdA, and mass).")
     st.dataframe(sel_edit[["name","height_cm","weight_kg","ftp_w","Bike","Bike_kg","Cd"]], use_container_width=True, hide_index=True)
 
     # Draft model editor (default rules; for N>4 positions beyond 4 default to pos4 factor)
@@ -1183,6 +1280,7 @@ with tabs[0]:
             crr=float(crr),
             rho=float(rho),
             draft_factors=draft_factors,
+            effort_method=str(effort_method),
             cap_fraction=float(cap_fraction),
             strongest_pull_bounds=(float(strongest_min), float(strongest_max)),
             other_pull_max_s=float(other_max),
@@ -1197,7 +1295,7 @@ with tabs[0]:
         st.session_state["plan"] = plan
         st.session_state["riders_for_plan"] = riders
         st.session_state["draft_factors"] = draft_factors
-        st.session_state["env"] = {"crr": float(crr), "rho": float(rho), "cap_fraction": float(cap_fraction)}
+        st.session_state["env"] = {"crr": float(crr), "rho": float(rho), "cap_fraction": float(cap_fraction), "effort_method": str(effort_method)}
         # reset manual pulls
         st.session_state.pop("manual_pulls", None)
         st.session_state.pop("combined_table", None)
@@ -1214,15 +1312,16 @@ with tabs[0]:
     rho = st.session_state["env"]["rho"]
 
     st.success(plan.get("note", "Plan computed."))
-    st.metric("Target speed (km/h)", int(round(plan["v_kph"])))
-    st.metric("Target speed (m/s)", int(round(plan["v_mps"])))
+    st.metric("Target speed (km/h)", f"{plan['v_kph']:.1f}")
 
     pulls = plan["pulls_s"].copy()
     P = compute_power_matrix(riders, plan["v_mps"], float(crr), float(rho), draft_factors)
     avgW = avg_power_for_pulls(P, pulls)
+    effort_method = st.session_state["env"].get("effort_method", "NP")
+    effortW = compute_effort_w_for_pulls(P, pulls, effort_method)
 
     st.subheader("Combined rider plan (starting order)")
-    df_combined = build_combined_results_table(riders, pulls, P, avgW)
+    df_combined = build_combined_results_table(riders, pulls, P, avgW, effortW, effort_method)
     st.dataframe(df_combined, use_container_width=True, hide_index=True)
 
     # Manual pull adjustment
@@ -1251,7 +1350,8 @@ with tabs[0]:
             st.warning("Total rotation time must be > 0.")
         else:
             avgW2 = avg_power_for_pulls(P, new_pulls)
-            df_new = build_combined_results_table(riders, new_pulls, P, avgW2)
+            effortW2 = compute_effort_w_for_pulls(P, new_pulls, effort_method)
+            df_new = build_combined_results_table(riders, new_pulls, P, avgW2, effortW2, effort_method)
             st.session_state["manual_pulls"] = new_pulls
             st.session_state["combined_table"] = df_new
             st.rerun()
