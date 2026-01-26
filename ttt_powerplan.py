@@ -457,11 +457,18 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS riders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
+                short_name TEXT,
                 height_cm REAL NOT NULL,
                 weight_kg REAL NOT NULL,
+                p20_w REAL NOT NULL,
                 ftp_w REAL NOT NULL,
+                effective_max_hr REAL,
+                strava_url TEXT,
+                zwiftpower_url TEXT,
                 default_bike_id INTEGER,
                 FOREIGN KEY(default_bike_id) REFERENCES bikes(id) ON DELETE SET NULL
+            )
+            REFERENCES bikes(id) ON DELETE SET NULL
             )
             """
         )
@@ -475,11 +482,18 @@ def init_db() -> None:
                 CREATE TABLE IF NOT EXISTS riders_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
+                    short_name TEXT,
                     height_cm REAL NOT NULL,
                     weight_kg REAL NOT NULL,
+                    p20_w REAL NOT NULL,
                     ftp_w REAL NOT NULL,
+                    effective_max_hr REAL,
+                    strava_url TEXT,
+                    zwiftpower_url TEXT,
                     default_bike_id INTEGER,
                     FOREIGN KEY(default_bike_id) REFERENCES bikes(id) ON DELETE SET NULL
+                )
+                ON DELETE SET NULL
                 )
                 """
             )
@@ -517,15 +531,47 @@ def init_db() -> None:
                 bike_id = bike_map.get(key)
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO riders_new(name, height_cm, weight_kg, ftp_w, default_bike_id)
-                    VALUES (?,?,?,?,?)
+                    INSERT OR REPLACE INTO riders_new(name, short_name, height_cm, weight_kg, p20_w, ftp_w, effective_max_hr, strava_url, zwiftpower_url, default_bike_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (r["name"], float(r["height_cm"]), float(r["weight_kg"]), float(r["ftp_w"]), bike_id),
+                    (r["name"], None, float(r["height_cm"]), float(r["weight_kg"]), float(r["ftp_w"]) / 0.95, float(r["ftp_w"]), None, None, None, bike_id),
                 )
 
             # Replace old table
             conn.execute("DROP TABLE riders")
             conn.execute("ALTER TABLE riders_new RENAME TO riders")
+
+        # Migration: add extended rider fields and 20-min power based FTP if missing.
+        cols = _table_columns(conn, "riders")
+        # Add missing columns (SQLite supports ADD COLUMN).
+        def _add_col(sql: str):
+            try:
+                conn.execute(sql)
+            except Exception:
+                pass
+
+        if "short_name" not in cols:
+            _add_col("ALTER TABLE riders ADD COLUMN short_name TEXT")
+        if "p20_w" not in cols:
+            _add_col("ALTER TABLE riders ADD COLUMN p20_w REAL")
+        if "effective_max_hr" not in cols:
+            _add_col("ALTER TABLE riders ADD COLUMN effective_max_hr REAL")
+        if "strava_url" not in cols:
+            _add_col("ALTER TABLE riders ADD COLUMN strava_url TEXT")
+        if "zwiftpower_url" not in cols:
+            _add_col("ALTER TABLE riders ADD COLUMN zwiftpower_url TEXT")
+
+        cols = _table_columns(conn, "riders")
+        # If ftp_w exists but p20_w is null, backfill p20_w = ftp_w / 0.95
+        if "ftp_w" in cols and "p20_w" in cols:
+            conn.execute(
+                "UPDATE riders SET p20_w = COALESCE(p20_w, ftp_w / 0.95) WHERE p20_w IS NULL"
+            )
+            # Ensure ftp_w matches 0.95*p20_w going forward
+            conn.execute(
+                "UPDATE riders SET ftp_w = 0.95 * p20_w WHERE p20_w IS NOT NULL"
+            )
+
 
         # Ensure at least one bike exists
         n_bikes = conn.execute("SELECT COUNT(*) AS n FROM bikes").fetchone()["n"]
@@ -579,7 +625,7 @@ def fetch_riders_df() -> pd.DataFrame:
         rows = conn.execute(
             """
             SELECT
-              r.id, r.name, r.height_cm, r.weight_kg, r.ftp_w,
+              r.id, r.name, r.short_name, r.height_cm, r.weight_kg, r.p20_w, r.ftp_w, r.effective_max_hr, r.strava_url, r.zwiftpower_url,
               r.default_bike_id,
               b.name AS default_bike_name, b.bike_kg AS default_bike_kg, b.cd AS default_bike_cd
             FROM riders r
@@ -599,24 +645,49 @@ def fetch_riders_df() -> pd.DataFrame:
 
 def upsert_rider(
     name: str,
+    short_name: str | None,
     height_cm: float,
     weight_kg: float,
-    ftp_w: float,
+    p20_w: float,
+    effective_max_hr: float | None,
+    strava_url: str | None,
+    zwiftpower_url: str | None,
     default_bike_id: int | None,
 ) -> None:
+    """Insert or update a rider. FTP is stored as 0.95 * 20-min power."""
     init_db()
+    ftp_w = 0.95 * float(p20_w)
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO riders(name, height_cm, weight_kg, ftp_w, default_bike_id)
-            VALUES (?,?,?,?,?)
+            INSERT INTO riders(
+              name, short_name, height_cm, weight_kg, p20_w, ftp_w,
+              effective_max_hr, strava_url, zwiftpower_url, default_bike_id
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(name) DO UPDATE SET
+              short_name=excluded.short_name,
               height_cm=excluded.height_cm,
               weight_kg=excluded.weight_kg,
+              p20_w=excluded.p20_w,
               ftp_w=excluded.ftp_w,
+              effective_max_hr=excluded.effective_max_hr,
+              strava_url=excluded.strava_url,
+              zwiftpower_url=excluded.zwiftpower_url,
               default_bike_id=excluded.default_bike_id
             """,
-            (name.strip(), float(height_cm), float(weight_kg), float(ftp_w), default_bike_id),
+            (
+                name.strip(),
+                (short_name.strip() if isinstance(short_name, str) and short_name.strip() else None),
+                float(height_cm),
+                float(weight_kg),
+                float(p20_w),
+                float(ftp_w),
+                (float(effective_max_hr) if effective_max_hr not in (None, "") else None),
+                (str(strava_url).strip() if isinstance(strava_url, str) and str(strava_url).strip() else None),
+                (str(zwiftpower_url).strip() if isinstance(zwiftpower_url, str) and str(zwiftpower_url).strip() else None),
+                default_bike_id,
+            ),
         )
         conn.commit()
 
@@ -636,81 +707,191 @@ def export_bikes_csv() -> str:
 
 def export_riders_csv() -> str:
     df = fetch_riders_df()
-    cols = ["name", "height_cm", "weight_kg", "ftp_w", "default_bike_name"]
+    cols = [
+        "name",
+        "short_name",
+        "height_cm",
+        "weight_kg",
+        "p20_w",
+        "ftp_w",
+        "effective_max_hr",
+        "strava_url",
+        "zwiftpower_url",
+        "default_bike_name",
+    ]
     if df.empty:
         return pd.DataFrame(columns=cols).to_csv(index=False)
-    # Ensure column exists even if NULLs
     for c in cols:
         if c not in df.columns:
-            df[c] = ""
-    return df[cols].to_csv(index=False)
-
-
+            df[c] = None
+    df = df[cols].copy()
+    return df.to_csv(index=False)
 def import_bikes_csv(csv_bytes: bytes) -> Tuple[int, List[str]]:
     """Import bikes from CSV with columns: name,bike_kg,cd"""
+    init_db()
     df = pd.read_csv(io.BytesIO(csv_bytes))
+    df.columns = [c.strip().lower() for c in df.columns]
     required = {"name", "bike_kg", "cd"}
-    if not required.issubset(set(df.columns.str.lower())):
-        # try case-insensitive map
-        df.columns = [c.lower() for c in df.columns]
     if not required.issubset(set(df.columns)):
         return 0, [f"CSV must contain columns: {sorted(required)}"]
-    errors = []
-    n_ok = 0
-    for _, row in df.iterrows():
+
+    errors: List[str] = []
+    count = 0
+    for _, r in df.iterrows():
         try:
-            upsert_bike(str(row["name"]), float(row["bike_kg"]), float(row["cd"]))
-            n_ok += 1
+            upsert_bike(
+                name=str(r["name"]).strip(),
+                bike_kg=float(r["bike_kg"]),
+                cd=float(r["cd"]),
+            )
+            count += 1
         except Exception as e:
-            errors.append(f"{row.get('name','(unknown)')}: {e}")
-    return n_ok, errors
+            errors.append(f"{r.get('name','<blank>')}: {e}")
+    return count, errors
+
+
+def _normalize_riders_import_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Accepts common column headings from CSV/XLSX and returns normalized columns."""
+    # Map common headers (case-insensitive)
+    colmap = {c.lower().strip(): c for c in df.columns}
+
+    def pick(*names: str) -> str | None:
+        for n in names:
+            if n.lower() in colmap:
+                return colmap[n.lower()]
+        return None
+
+    name_c = pick("name", "rider", "rider name")
+    height_c = pick("height_cm", "height (cm)", "height", "Height (cm)")
+    weight_c = pick("weight_kg", "weight (kg)", "weight", "Weight (kg)")
+    p20_c = pick("p20_w", "20min power (w)", "20min max power", "20min max power (w)", "20min power", "20min", "20min Power (W)")
+    ftp_c = pick("ftp_w", "ftp (w)", "ftp", "FTP (W)")
+    short_c = pick("short_name", "short name", "Short Name")
+    hr_c = pick("effective_max_hr", "effective maxhr", "effective max hr", "Effective MaxHR")
+    strava_c = pick("strava_url", "strava", "Strava")
+    zwp_c = pick("zwiftpower_url", "zwift power", "zwiftpower", "Zwift Power")
+    bike_c = pick("default_bike_name", "bike", "bike name", "default bike", "default_bike")
+
+    if name_c is None:
+        raise ValueError("Missing rider name column (e.g. 'name' or 'Rider').")
+    if height_c is None or weight_c is None:
+        raise ValueError("Missing height/weight columns (e.g. 'Height (cm)' and 'weight (kg)').")
+
+    out = pd.DataFrame()
+    out["name"] = df[name_c].astype(str).str.strip()
+    out["height_cm"] = pd.to_numeric(df[height_c], errors="coerce")
+    out["weight_kg"] = pd.to_numeric(df[weight_c], errors="coerce")
+
+    # Prefer 20-min power; fall back to FTP if provided.
+    if p20_c is not None:
+        out["p20_w"] = pd.to_numeric(df[p20_c], errors="coerce")
+    else:
+        out["p20_w"] = np.nan
+
+    if ftp_c is not None:
+        ftp = pd.to_numeric(df[ftp_c], errors="coerce")
+    else:
+        ftp = np.nan
+
+    # If p20 is missing but ftp exists, infer p20 = ftp/0.95
+    out["p20_w"] = out["p20_w"].where(~out["p20_w"].isna(), ftp / 0.95)
+
+    out["short_name"] = df[short_c].astype(str).str.strip() if short_c is not None else None
+    out["effective_max_hr"] = pd.to_numeric(df[hr_c], errors="coerce") if hr_c is not None else np.nan
+    out["strava_url"] = df[strava_c].astype(str).str.strip() if strava_c is not None else None
+    out["zwiftpower_url"] = df[zwp_c].astype(str).str.strip() if zwp_c is not None else None
+    out["default_bike_name"] = df[bike_c].astype(str).str.strip() if bike_c is not None else None
+
+    # Clean up 'nan' strings from optional text fields
+    for c in ["short_name", "strava_url", "zwiftpower_url", "default_bike_name"]:
+        if c in out.columns:
+            out[c] = out[c].replace({"nan": None, "NaN": None, "None": None})
+
+    # Drop rows without essential numeric fields
+    out = out.dropna(subset=["height_cm", "weight_kg", "p20_w"])
+    return out
 
 
 def import_riders_csv(csv_bytes: bytes) -> Tuple[int, List[str]]:
-    """Import riders from CSV with columns: name,height_cm,weight_kg,ftp_w,default_bike_name (optional)."""
+    """Import riders from CSV. FTP is calculated as 0.95 * 20min power."""
     init_db()
     df = pd.read_csv(io.BytesIO(csv_bytes))
-    df.columns = [c.lower() for c in df.columns]
-    required = {"name", "height_cm", "weight_kg", "ftp_w"}
-    if not required.issubset(set(df.columns)):
-        return 0, [f"CSV must contain columns: {sorted(required)}"]
-    bikes = fetch_bikes_df()
-    bike_name_to_id = {str(r["name"]): int(r["id"]) for _, r in bikes.iterrows()}
-    default_bike_id = int(bikes.iloc[0]["id"]) if len(bikes) else None
+    df = _normalize_riders_import_df(df)
 
-    errors = []
-    n_ok = 0
-    for _, row in df.iterrows():
+    bikes = fetch_bikes_df()
+    bike_name_to_id = {str(r["name"]): int(r["id"]) for _, r in bikes.iterrows()} if not bikes.empty else {}
+
+    errors: List[str] = []
+    count = 0
+
+    for _, r in df.iterrows():
         try:
             bike_id = None
-            if "default_bike_name" in df.columns and pd.notna(row.get("default_bike_name")):
-                bn = str(row.get("default_bike_name"))
-                bike_id = bike_name_to_id.get(bn)
-                if bike_id is None and bn.strip():
-                    # Create a new bike entry with defaults if unknown
-                    upsert_bike(bn.strip(), 8.0, 0.69)
-                    bikes2 = fetch_bikes_df()
-                    bike_name_to_id = {str(r["name"]): int(r["id"]) for _, r in bikes2.iterrows()}
-                    bike_id = bike_name_to_id.get(bn.strip())
-            if bike_id is None:
-                bike_id = default_bike_id
+            if r.get("default_bike_name"):
+                bn = str(r["default_bike_name"]).strip()
+                if bn:
+                    if bn not in bike_name_to_id:
+                        # Create missing bike with defaults
+                        upsert_bike(bn, 8.0, 0.69)
+                        bikes2 = fetch_bikes_df()
+                        bike_name_to_id = {str(x["name"]): int(x["id"]) for _, x in bikes2.iterrows()}
+                    bike_id = bike_name_to_id.get(bn)
 
             upsert_rider(
-                name=str(row["name"]),
-                height_cm=float(row["height_cm"]),
-                weight_kg=float(row["weight_kg"]),
-                ftp_w=float(row["ftp_w"]),
+                name=str(r["name"]),
+                short_name=r.get("short_name"),
+                height_cm=float(r["height_cm"]),
+                weight_kg=float(r["weight_kg"]),
+                p20_w=float(r["p20_w"]),
+                effective_max_hr=(None if pd.isna(r.get("effective_max_hr")) else float(r.get("effective_max_hr"))),
+                strava_url=r.get("strava_url"),
+                zwiftpower_url=r.get("zwiftpower_url"),
                 default_bike_id=bike_id,
             )
-            n_ok += 1
+            count += 1
         except Exception as e:
-            errors.append(f"{row.get('name','(unknown)')}: {e}")
-    return n_ok, errors
+            errors.append(f"{r.get('name','<blank>')}: {e}")
+    return count, errors
 
 
-# =============================
-# Streamlit UI
-# =============================
+def import_riders_xlsx(xlsx_bytes: bytes, sheet_name: str | None = None) -> Tuple[int, List[str]]:
+    """Import riders from an Excel file (.xlsx)."""
+    init_db()
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), sheet_name=sheet_name or 0)
+    df = _normalize_riders_import_df(df)
+    # Reuse CSV importer logic by converting to records loop
+    bikes = fetch_bikes_df()
+    bike_name_to_id = {str(r["name"]): int(r["id"]) for _, r in bikes.iterrows()} if not bikes.empty else {}
+
+    errors: List[str] = []
+    count = 0
+    for _, r in df.iterrows():
+        try:
+            bike_id = None
+            if r.get("default_bike_name"):
+                bn = str(r["default_bike_name"]).strip()
+                if bn:
+                    if bn not in bike_name_to_id:
+                        upsert_bike(bn, 8.0, 0.69)
+                        bikes2 = fetch_bikes_df()
+                        bike_name_to_id = {str(x["name"]): int(x["id"]) for _, x in bikes2.iterrows()}
+                    bike_id = bike_name_to_id.get(bn)
+
+            upsert_rider(
+                name=str(r["name"]),
+                short_name=r.get("short_name"),
+                height_cm=float(r["height_cm"]),
+                weight_kg=float(r["weight_kg"]),
+                p20_w=float(r["p20_w"]),
+                effective_max_hr=(None if pd.isna(r.get("effective_max_hr")) else float(r.get("effective_max_hr"))),
+                strava_url=r.get("strava_url"),
+                zwiftpower_url=r.get("zwiftpower_url"),
+                default_bike_id=bike_id,
+            )
+            count += 1
+        except Exception as e:
+            errors.append(f"{r.get('name','<blank>')}: {e}")
+    return count, errors
 st.set_page_config(page_title="Zwift TTT Power Plan", layout="wide")
 st.title("Zwift Indoor Team Time Trial Pull & Power Planner")
 
@@ -793,15 +974,30 @@ with tabs[1]:
     with col1:
         st.subheader("Add / Update rider")
         r_name = st.text_input("Name", value="")
+        r_short = st.text_input("Short name", value="")
         r_height = st.number_input("Height (cm)", value=180.0, step=1.0)
         r_weight = st.number_input("Weight (kg)", value=75.0, step=0.5)
-        r_ftp = st.number_input("FTP (W)", value=280.0, step=5.0)
+        r_p20 = st.number_input("20 min max power (W)", value=300.0, step=5.0)
+        st.caption(f"Calculated FTP (95% of 20 min): {int(round(0.95 * r_p20))} W")
+        r_maxhr = st.number_input("Effective max HR (bpm)", value=0.0, step=1.0, help="Leave 0 if unknown")
+        r_strava = st.text_input("Strava link", value="")
+        r_zwp = st.text_input("ZwiftPower link", value="")
         r_bike_name = st.selectbox("Default bike", bike_names, index=0, key="r_default_bike") if bike_names else None
 
         if st.button("Save rider", key="save_rider"):
             if r_name.strip():
                 bike_id = bike_name_to_id.get(r_bike_name) if r_bike_name else None
-                upsert_rider(r_name.strip(), r_height, r_weight, r_ftp, bike_id)
+                upsert_rider(
+                    name=r_name.strip(),
+                    short_name=(r_short.strip() or None),
+                    height_cm=float(r_height),
+                    weight_kg=float(r_weight),
+                    p20_w=float(r_p20),
+                    effective_max_hr=(None if float(r_maxhr) <= 0 else float(r_maxhr)),
+                    strava_url=(r_strava.strip() or None),
+                    zwiftpower_url=(r_zwp.strip() or None),
+                    default_bike_id=bike_id,
+                )
                 st.success("Rider saved.")
                 st.rerun()
             else:
@@ -829,13 +1025,18 @@ with tabs[1]:
         show["default_bike_name"] = show["default_bike_name"].fillna(default_bike_name)
         st.dataframe(show[["name","height_cm","weight_kg","ftp_w","default_bike_name"]], use_container_width=True, hide_index=True)
 
-    st.subheader("Import / Export riders (CSV)")
+    st.subheader("Import / Export riders (CSV / XLSX)")
     exp = export_riders_csv()
     st.download_button("Download riders.csv", data=exp, file_name="riders.csv", mime="text/csv")
 
-    up = st.file_uploader("Import riders.csv", type=["csv"], key="import_riders")
+    up = st.file_uploader("Import riders file", type=["csv", "xlsx"], key="import_riders")
     if up is not None:
-        n_ok, errors = import_riders_csv(up.read())
+        fn = (up.name or "").lower()
+        if fn.endswith(".xlsx"):
+            n_ok, errors = import_riders_xlsx(up.read())
+        else:
+            n_ok, errors = import_riders_csv(up.read())
+
         if errors:
             st.warning("Imported with some issues:")
             for e in errors[:10]:
@@ -909,21 +1110,30 @@ with tabs[0]:
 
     # Editable: allow temporary changes to height/weight/ftp and bike choice/params
     st.subheader("Edit selected rider values (temporary overrides)")
+        # Ensure we have 20-min power; if missing, infer from FTP.
+    sel["p20_w"] = sel["p20_w"].where(~sel["p20_w"].isna(), sel["ftp_w"] / 0.95)
+    sel["ftp_w"] = 0.95 * sel["p20_w"]
+
+    st.caption("Edit selected rider values (temporary overrides)")
     sel_edit = st.data_editor(
-        sel[["name","height_cm","weight_kg","ftp_w","Bike","Bike_kg","Cd"]],
+        sel[["name","height_cm","weight_kg","p20_w","ftp_w","Bike","Bike_kg","Cd"]],
         hide_index=True,
         use_container_width=True,
         column_config={
             "name": st.column_config.TextColumn("Rider", disabled=True),
             "height_cm": st.column_config.NumberColumn("Height (cm)", step=1, format="%.0f"),
             "weight_kg": st.column_config.NumberColumn("Weight (kg)", step=0.1, format="%.1f"),
-            "ftp_w": st.column_config.NumberColumn("FTP (W)", step=1, format="%.0f"),
+            "p20_w": st.column_config.NumberColumn("20 min max (W)", step=1, format="%.0f"),
+            "ftp_w": st.column_config.NumberColumn("FTP (calc, W)", disabled=True, format="%.0f"),
             "Bike": st.column_config.SelectboxColumn("Bike", options=bike_names),
             "Bike_kg": st.column_config.NumberColumn("Bike kg (override)", step=0.1, format="%.1f"),
             "Cd": st.column_config.NumberColumn("Cd (override)", step=0.001, format="%.3f"),
         },
         key="sel_edit",
     )
+
+    # Recompute FTP from edited 20-min power
+    sel_edit["ftp_w"] = 0.95 * sel_edit["p20_w"]
 
     # Order rule: strongest -> weakest using estimated cap-speed proxy (includes FTP, CdA, mass)
     def _solve_front_speed_mps(row) -> float:
