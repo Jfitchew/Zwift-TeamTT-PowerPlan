@@ -1436,14 +1436,14 @@ with tabs[0]:
         st.warning("Card export unavailable: could not find effort columns in the combined table.")
     else:
         df_card = pd.DataFrame({
-            "Rider Order": df_for_card["Rider"].astype(str),
-            "Front Interval": df_for_card["Pull_s"].astype(int).astype(str) + " secs",
-            "Front Power": df_for_card["Pull_W"].astype(int),
-            "wkg": (df_for_card["Pull_W"].astype(float) / np.maximum(1e-9, np.array([r.weight_kg for r in riders], dtype=float))).round(1),
-            "Drafting Avg Power": df_for_card["DraftAvg_W"].astype(int),
-            "wkg ": (df_for_card["DraftAvg_W"].astype(float) / np.maximum(1e-9, np.array([r.weight_kg for r in riders], dtype=float))).round(1),
+            "Rider\nOrder": df_for_card["Rider"].astype(str),
+            "Front\nInterval": df_for_card["Pull_s"].astype(int).astype(str) + " secs",
+            "Front\nPower": df_for_card["Pull_W"].astype(int),
+            "Front\nwkg": (df_for_card["Pull_W"].astype(float) / np.maximum(1e-9, np.array([r.weight_kg for r in riders], dtype=float))).round(1),
+            "Drafting\nAvg Power": df_for_card["DraftAvg_W"].astype(int),
+            "Draft\nwkg ": (df_for_card["DraftAvg_W"].astype(float) / np.maximum(1e-9, np.array([r.weight_kg for r in riders], dtype=float))).round(1),
             "Overall": df_for_card[effort_col_w].astype(int),
-            "NP % FTP": df_for_card[effort_col_pct].astype(float).round(1),
+            "NP\n% FTP": df_for_card[effort_col_pct].astype(float).round(1),
         })
 
         png_bytes = plan_table_png(df_card)
