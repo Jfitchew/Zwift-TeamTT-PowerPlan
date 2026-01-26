@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import sqlite3
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -414,19 +415,43 @@ def build_position_power_table(riders: List[Rider], v_mps: float, crr: float, rh
 # =============================
 # Local SQLite rider database
 # =============================
+
+# =============================
+# Local database (SQLite)
+# =============================
 def db_path() -> Path:
     # Local to the script directory for portability.
-    return Path(__file__).with_name("riders.sqlite3")
+    return Path(__file__).with_name("ttt_riders.sqlite3")
 
 
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path()), check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # Basic safety
+    conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    return [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
 def init_db() -> None:
+    """Create tables and migrate from older single-table schema if detected."""
     with get_conn() as conn:
+        # Bikes table
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bikes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                bike_kg REAL NOT NULL DEFAULT 8,
+                cd REAL NOT NULL DEFAULT 0.69
+            )
+            """
+        )
+
+        # Detect if an older riders table exists and contains bike_kg/cd directly
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS riders (
@@ -435,38 +460,163 @@ def init_db() -> None:
                 height_cm REAL NOT NULL,
                 weight_kg REAL NOT NULL,
                 ftp_w REAL NOT NULL,
-                bike_kg REAL NOT NULL DEFAULT 8,
-                cd REAL NOT NULL DEFAULT 0.69
+                default_bike_id INTEGER,
+                FOREIGN KEY(default_bike_id) REFERENCES bikes(id) ON DELETE SET NULL
             )
             """
         )
+
+        # Migration: if riders table has legacy columns bike_kg and cd, migrate to bikes table.
+        cols = _table_columns(conn, "riders")
+        if ("bike_kg" in cols) or ("cd" in cols):
+            # Create a new riders table with correct schema
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS riders_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    height_cm REAL NOT NULL,
+                    weight_kg REAL NOT NULL,
+                    ftp_w REAL NOT NULL,
+                    default_bike_id INTEGER,
+                    FOREIGN KEY(default_bike_id) REFERENCES bikes(id) ON DELETE SET NULL
+                )
+                """
+            )
+            # Collect unique bikes from old rider rows
+            old_rows = conn.execute(
+                "SELECT name, height_cm, weight_kg, ftp_w, bike_kg, cd FROM riders"
+            ).fetchall()
+
+            bike_map: Dict[Tuple[float, float], int] = {}
+            for r in old_rows:
+                bk = float(r["bike_kg"]) if r["bike_kg"] is not None else 8.0
+                cdv = float(r["cd"]) if r["cd"] is not None else 0.69
+                key = (round(bk, 3), round(cdv, 4))
+                if key not in bike_map:
+                    # Ensure unique bike name
+                    base = f"Imported {key[0]:g}kg Cd {key[1]:g}"
+                    name = base
+                    suffix = 2
+                    while True:
+                        try:
+                            conn.execute(
+                                "INSERT INTO bikes(name, bike_kg, cd) VALUES (?,?,?)",
+                                (name, key[0], key[1]),
+                            )
+                            bike_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                            bike_map[key] = bike_id
+                            break
+                        except sqlite3.IntegrityError:
+                            name = f"{base} ({suffix})"
+                            suffix += 1
+
+            # Insert riders into new table
+            for r in old_rows:
+                key = (round(float(r["bike_kg"]), 3), round(float(r["cd"]), 4))
+                bike_id = bike_map.get(key)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO riders_new(name, height_cm, weight_kg, ftp_w, default_bike_id)
+                    VALUES (?,?,?,?,?)
+                    """,
+                    (r["name"], float(r["height_cm"]), float(r["weight_kg"]), float(r["ftp_w"]), bike_id),
+                )
+
+            # Replace old table
+            conn.execute("DROP TABLE riders")
+            conn.execute("ALTER TABLE riders_new RENAME TO riders")
+
+        # Ensure at least one bike exists
+        n_bikes = conn.execute("SELECT COUNT(*) AS n FROM bikes").fetchone()["n"]
+        if n_bikes == 0:
+            conn.execute("INSERT INTO bikes(name, bike_kg, cd) VALUES (?,?,?)", ("Default", 8.0, 0.69))
+
+        conn.commit()
+
+
+def fetch_bikes_df() -> pd.DataFrame:
+    init_db()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name, bike_kg, cd FROM bikes ORDER BY name ASC"
+        ).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["id", "name", "bike_kg", "cd"])
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+def upsert_bike(name: str, bike_kg: float, cd: float) -> None:
+    init_db()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO bikes(name, bike_kg, cd)
+            VALUES (?,?,?)
+            ON CONFLICT(name) DO UPDATE SET
+              bike_kg=excluded.bike_kg,
+              cd=excluded.cd
+            """,
+            (name.strip(), float(bike_kg), float(cd)),
+        )
+        conn.commit()
+
+
+def delete_bike_by_name(name: str) -> None:
+    init_db()
+    with get_conn() as conn:
+        n_bikes = conn.execute("SELECT COUNT(*) AS n FROM bikes").fetchone()["n"]
+        if n_bikes <= 1:
+            # Keep at least one bike
+            return
+        conn.execute("DELETE FROM bikes WHERE name=?", (name.strip(),))
         conn.commit()
 
 
 def fetch_riders_df() -> pd.DataFrame:
     init_db()
     with get_conn() as conn:
-        rows = conn.execute("SELECT id, name, height_cm, weight_kg, ftp_w, bike_kg, cd FROM riders ORDER BY name ASC").fetchall()
+        rows = conn.execute(
+            """
+            SELECT
+              r.id, r.name, r.height_cm, r.weight_kg, r.ftp_w,
+              r.default_bike_id,
+              b.name AS default_bike_name, b.bike_kg AS default_bike_kg, b.cd AS default_bike_cd
+            FROM riders r
+            LEFT JOIN bikes b ON b.id = r.default_bike_id
+            ORDER BY r.name ASC
+            """
+        ).fetchall()
     if not rows:
-        return pd.DataFrame(columns=["id", "name", "height_cm", "weight_kg", "ftp_w", "bike_kg", "cd"])
+        return pd.DataFrame(
+            columns=[
+                "id","name","height_cm","weight_kg","ftp_w",
+                "default_bike_id","default_bike_name","default_bike_kg","default_bike_cd"
+            ]
+        )
     return pd.DataFrame([dict(r) for r in rows])
 
 
-def upsert_rider(row: Dict) -> None:
+def upsert_rider(
+    name: str,
+    height_cm: float,
+    weight_kg: float,
+    ftp_w: float,
+    default_bike_id: int | None,
+) -> None:
     init_db()
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO riders (name, height_cm, weight_kg, ftp_w, bike_kg, cd)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO riders(name, height_cm, weight_kg, ftp_w, default_bike_id)
+            VALUES (?,?,?,?,?)
             ON CONFLICT(name) DO UPDATE SET
-                height_cm=excluded.height_cm,
-                weight_kg=excluded.weight_kg,
-                ftp_w=excluded.ftp_w,
-                bike_kg=excluded.bike_kg,
-                cd=excluded.cd
+              height_cm=excluded.height_cm,
+              weight_kg=excluded.weight_kg,
+              ftp_w=excluded.ftp_w,
+              default_bike_id=excluded.default_bike_id
             """,
-            (row["name"], row["height_cm"], row["weight_kg"], row["ftp_w"], row["bike_kg"], row["cd"]),
+            (name.strip(), float(height_cm), float(weight_kg), float(ftp_w), default_bike_id),
         )
         conn.commit()
 
@@ -474,183 +624,355 @@ def upsert_rider(row: Dict) -> None:
 def delete_rider_by_name(name: str) -> None:
     init_db()
     with get_conn() as conn:
-        conn.execute("DELETE FROM riders WHERE name = ?", (name,))
+        conn.execute("DELETE FROM riders WHERE name=?", (name.strip(),))
         conn.commit()
+
+
+def export_bikes_csv() -> str:
+    df = fetch_bikes_df()
+    cols = ["name", "bike_kg", "cd"]
+    return df[cols].to_csv(index=False)
+
+
+def export_riders_csv() -> str:
+    df = fetch_riders_df()
+    cols = ["name", "height_cm", "weight_kg", "ftp_w", "default_bike_name"]
+    if df.empty:
+        return pd.DataFrame(columns=cols).to_csv(index=False)
+    # Ensure column exists even if NULLs
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[cols].to_csv(index=False)
+
+
+def import_bikes_csv(csv_bytes: bytes) -> Tuple[int, List[str]]:
+    """Import bikes from CSV with columns: name,bike_kg,cd"""
+    df = pd.read_csv(io.BytesIO(csv_bytes))
+    required = {"name", "bike_kg", "cd"}
+    if not required.issubset(set(df.columns.str.lower())):
+        # try case-insensitive map
+        df.columns = [c.lower() for c in df.columns]
+    if not required.issubset(set(df.columns)):
+        return 0, [f"CSV must contain columns: {sorted(required)}"]
+    errors = []
+    n_ok = 0
+    for _, row in df.iterrows():
+        try:
+            upsert_bike(str(row["name"]), float(row["bike_kg"]), float(row["cd"]))
+            n_ok += 1
+        except Exception as e:
+            errors.append(f"{row.get('name','(unknown)')}: {e}")
+    return n_ok, errors
+
+
+def import_riders_csv(csv_bytes: bytes) -> Tuple[int, List[str]]:
+    """Import riders from CSV with columns: name,height_cm,weight_kg,ftp_w,default_bike_name (optional)."""
+    init_db()
+    df = pd.read_csv(io.BytesIO(csv_bytes))
+    df.columns = [c.lower() for c in df.columns]
+    required = {"name", "height_cm", "weight_kg", "ftp_w"}
+    if not required.issubset(set(df.columns)):
+        return 0, [f"CSV must contain columns: {sorted(required)}"]
+    bikes = fetch_bikes_df()
+    bike_name_to_id = {str(r["name"]): int(r["id"]) for _, r in bikes.iterrows()}
+    default_bike_id = int(bikes.iloc[0]["id"]) if len(bikes) else None
+
+    errors = []
+    n_ok = 0
+    for _, row in df.iterrows():
+        try:
+            bike_id = None
+            if "default_bike_name" in df.columns and pd.notna(row.get("default_bike_name")):
+                bn = str(row.get("default_bike_name"))
+                bike_id = bike_name_to_id.get(bn)
+                if bike_id is None and bn.strip():
+                    # Create a new bike entry with defaults if unknown
+                    upsert_bike(bn.strip(), 8.0, 0.69)
+                    bikes2 = fetch_bikes_df()
+                    bike_name_to_id = {str(r["name"]): int(r["id"]) for _, r in bikes2.iterrows()}
+                    bike_id = bike_name_to_id.get(bn.strip())
+            if bike_id is None:
+                bike_id = default_bike_id
+
+            upsert_rider(
+                name=str(row["name"]),
+                height_cm=float(row["height_cm"]),
+                weight_kg=float(row["weight_kg"]),
+                ftp_w=float(row["ftp_w"]),
+                default_bike_id=bike_id,
+            )
+            n_ok += 1
+        except Exception as e:
+            errors.append(f"{row.get('name','(unknown)')}: {e}")
+    return n_ok, errors
 
 
 # =============================
 # Streamlit UI
 # =============================
-st.set_page_config(page_title="Zwift TTT Power Planner", layout="wide")
-st.title("Zwift TTT Power Planner")
+st.set_page_config(page_title="Zwift TTT Power Plan", layout="wide")
+st.title("Zwift Indoor Team Time Trial Pull & Power Planner")
 
-tabs = st.tabs(["Power Plan", "Rider Database"])
+init_db()
+df_riders_all = fetch_riders_df()
+df_bikes_all = fetch_bikes_df()
+
+tabs = st.tabs(["Power Plan", "Rider Database", "Bike Database"])
 
 # -----------------------------
-# Rider database tab
+# Bike Database tab
 # -----------------------------
-with tabs[1]:
-    st.subheader("Local rider database")
-    st.caption("Stored locally in SQLite next to this script. Edit values and click **Save**. Tick Delete to remove a rider.")
+with tabs[2]:
+    st.header("Bike Database (local SQLite)")
+    st.caption("Maintain bikes here. Rider records reference a default bike, but you can override bike choice per plan run.")
 
-    db_df = fetch_riders_df()
+    colA, colB = st.columns([1, 1])
 
-    if db_df.empty:
-        st.info("Database is empty. Add riders below.")
-        db_df = pd.DataFrame(columns=["id", "name", "height_cm", "weight_kg", "ftp_w", "bike_kg", "cd"])
-
-    # Editable grid
-    edit_df = db_df.copy()
-    if "delete" not in edit_df.columns:
-        edit_df.insert(0, "delete", False)
-
-    edited_db = st.data_editor(
-        edit_df,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        column_config={
-            "id": st.column_config.NumberColumn("id", disabled=True),
-            "delete": st.column_config.CheckboxColumn("Delete"),
-            "name": st.column_config.TextColumn("name"),
-            "height_cm": st.column_config.NumberColumn("height_cm"),
-            "weight_kg": st.column_config.NumberColumn("weight_kg"),
-            "ftp_w": st.column_config.NumberColumn("ftp_w"),
-            "bike_kg": st.column_config.NumberColumn("bike_kg"),
-            "cd": st.column_config.NumberColumn("cd"),
-        },
-        key="db_editor",
-    )
-
-    colA, colB = st.columns([1, 3])
     with colA:
-        if st.button("Save changes to DB"):
-            # Apply deletes first
-            for _, r in edited_db.iterrows():
-                name = str(r.get("name", "")).strip()
-                if not name:
-                    continue
-                if bool(r.get("delete", False)):
-                    delete_rider_by_name(name)
-
-            # Upsert all non-deleted rows with valid data
-            for _, r in edited_db.iterrows():
-                if bool(r.get("delete", False)):
-                    continue
-                name = str(r.get("name", "")).strip()
-                if not name:
-                    continue
-                row = {
-                    "name": name,
-                    "height_cm": float(r["height_cm"]),
-                    "weight_kg": float(r["weight_kg"]),
-                    "ftp_w": float(r["ftp_w"]),
-                    "bike_kg": float(r.get("bike_kg", 8.0)),
-                    "cd": float(r.get("cd", 0.69)),
-                }
-                upsert_rider(row)
-
-            st.success("Database updated.")
-            st.rerun()
+        st.subheader("Add / Update bike")
+        bike_name = st.text_input("Bike name", value="")
+        bike_kg = st.number_input("Bike weight (kg)", value=8.0, step=0.1)
+        bike_cd = st.number_input("Bike+rider Cd", value=0.69, step=0.01, format="%.3f")
+        if st.button("Save bike", key="save_bike"):
+            if bike_name.strip():
+                upsert_bike(bike_name.strip(), bike_kg, bike_cd)
+                st.success("Bike saved.")
+                st.rerun()
+            else:
+                st.warning("Bike name cannot be empty.")
 
     with colB:
-        st.caption("Tip: keep rider names unique. The app uses names for selection & updating.")
+        st.subheader("Delete bike")
+        bikes_df = fetch_bikes_df()
+        if len(bikes_df) <= 1:
+            st.info("At least one bike must exist; deletion disabled.")
+        else:
+            del_bike = st.selectbox("Select bike to delete", bikes_df["name"].tolist(), key="del_bike")
+            if st.button("Delete selected bike", key="delete_bike"):
+                delete_bike_by_name(del_bike)
+                st.success("Bike deleted.")
+                st.rerun()
+
+    st.subheader("Current bikes")
+    st.dataframe(fetch_bikes_df().assign(
+        bike_kg=lambda d: d["bike_kg"].round(3),
+        cd=lambda d: d["cd"].round(4),
+    ), use_container_width=True, hide_index=True)
+
+    st.subheader("Import / Export bikes (CSV)")
+    exp = export_bikes_csv()
+    st.download_button("Download bikes.csv", data=exp, file_name="bikes.csv", mime="text/csv")
+
+    up = st.file_uploader("Import bikes.csv", type=["csv"], key="import_bikes")
+    if up is not None:
+        n_ok, errors = import_bikes_csv(up.read())
+        if errors:
+            st.warning("Imported with some issues:")
+            for e in errors[:10]:
+                st.write(f"- {e}")
+            if len(errors) > 10:
+                st.write(f"...and {len(errors)-10} more.")
+        st.success(f"Imported/updated {n_ok} bikes.")
+        st.rerun()
 
 # -----------------------------
-# Power plan tab
+# Rider Database tab
+# -----------------------------
+with tabs[1]:
+    st.header("Rider Database (local SQLite)")
+    st.caption("Maintain rider anthropometrics and FTP here. Each rider can have a default bike (optional).")
+
+    bikes_df = fetch_bikes_df()
+    bike_name_to_id = {str(r["name"]): int(r["id"]) for _, r in bikes_df.iterrows()}
+    bike_names = bikes_df["name"].tolist()
+    default_bike_name = bike_names[0] if bike_names else "Default"
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("Add / Update rider")
+        r_name = st.text_input("Name", value="")
+        r_height = st.number_input("Height (cm)", value=180.0, step=1.0)
+        r_weight = st.number_input("Weight (kg)", value=75.0, step=0.5)
+        r_ftp = st.number_input("FTP (W)", value=280.0, step=5.0)
+        r_bike_name = st.selectbox("Default bike", bike_names, index=0, key="r_default_bike") if bike_names else None
+
+        if st.button("Save rider", key="save_rider"):
+            if r_name.strip():
+                bike_id = bike_name_to_id.get(r_bike_name) if r_bike_name else None
+                upsert_rider(r_name.strip(), r_height, r_weight, r_ftp, bike_id)
+                st.success("Rider saved.")
+                st.rerun()
+            else:
+                st.warning("Rider name cannot be empty.")
+
+    with col2:
+        st.subheader("Delete rider")
+        riders_df = fetch_riders_df()
+        if riders_df.empty:
+            st.info("No riders in database yet.")
+        else:
+            del_name = st.selectbox("Select rider to delete", riders_df["name"].tolist(), key="del_rider")
+            if st.button("Delete selected rider", key="delete_rider"):
+                delete_rider_by_name(del_name)
+                st.success("Rider deleted.")
+                st.rerun()
+
+    st.subheader("Current riders")
+    riders_df = fetch_riders_df()
+    if not riders_df.empty:
+        show = riders_df.copy()
+        show["height_cm"] = show["height_cm"].round(0).astype(int)
+        show["weight_kg"] = show["weight_kg"].round(1)
+        show["ftp_w"] = show["ftp_w"].round(0).astype(int)
+        show["default_bike_name"] = show["default_bike_name"].fillna(default_bike_name)
+        st.dataframe(show[["name","height_cm","weight_kg","ftp_w","default_bike_name"]], use_container_width=True, hide_index=True)
+
+    st.subheader("Import / Export riders (CSV)")
+    exp = export_riders_csv()
+    st.download_button("Download riders.csv", data=exp, file_name="riders.csv", mime="text/csv")
+
+    up = st.file_uploader("Import riders.csv", type=["csv"], key="import_riders")
+    if up is not None:
+        n_ok, errors = import_riders_csv(up.read())
+        if errors:
+            st.warning("Imported with some issues:")
+            for e in errors[:10]:
+                st.write(f"- {e}")
+            if len(errors) > 10:
+                st.write(f"...and {len(errors)-10} more.")
+        st.success(f"Imported/updated {n_ok} riders.")
+        st.rerun()
+
+# -----------------------------
+# Power Plan tab
 # -----------------------------
 with tabs[0]:
+    st.header("Power Plan")
+
     with st.sidebar:
-        st.header("Environment")
+        st.subheader("Environment / Model")
         crr = st.number_input("CRR", value=0.004, step=0.0005, format="%.4f")
         rho = st.number_input("Air density Ï (kg/mÂ³)", value=1.214, step=0.01, format="%.3f")
 
-        st.header("Constraints")
-        cap_fraction = st.slider("Rotation-average cap (%FTP)", 0.70, 1.05, 0.97, 0.01)
+        st.subheader("Constraints")
+        cap_fraction = st.slider("Average cap (%FTP)", min_value=0.70, max_value=1.05, value=0.97, step=0.01)
 
-        st.subheader("Pull bounds (solver)")
+        st.subheader("Pull time bounds (solver)")
         strongest_min = st.number_input("Strongest min pull (s)", value=60.0, step=5.0)
         strongest_max = st.number_input("Strongest max pull (s)", value=100.0, step=5.0)
         other_max = st.number_input("Other riders max pull (s)", value=120.0, step=5.0)
         min_pull = st.number_input("Min pull for non-zero pulls (s)", value=5.0, step=1.0)
         allow_zero = st.checkbox("Allow riders to skip the front (0 s pulls)", value=True)
 
-        st.header("Speed search")
-        vmin = st.number_input("Min speed scan (km/h)", value=30.0, step=1.0)
-        vmax = st.number_input("Max speed scan (km/h)", value=60.0, step=1.0)
+        st.subheader("Speed search")
+        vmin = st.number_input("Min speed to scan (km/h)", value=30.0, step=1.0)
+        vmax = st.number_input("Max speed to scan (km/h)", value=55.0, step=1.0)
         step = st.number_input("Coarse step (km/h)", value=0.25, step=0.05, format="%.2f")
 
-    st.subheader("Select riders for this plan")
+    riders_df = fetch_riders_df()
+    bikes_df = fetch_bikes_df()
 
-    all_db = fetch_riders_df()
-    if all_db.empty:
-        st.warning("Your rider database is empty. Add riders in the Rider Database tab.")
+    if riders_df.empty:
+        st.warning("No riders found in the database. Add riders in the Rider Database tab first.")
+        st.stop()
+    if bikes_df.empty:
+        st.warning("No bikes found in the database. Add bikes in the Bike Database tab first.")
         st.stop()
 
-    names = all_db["name"].tolist()
-    selected_names = st.multiselect("Pick riders (4â8)", options=names, default=names[:4])
+    bike_names = bikes_df["name"].tolist()
+    bike_name_to_row = {str(r["name"]): r for _, r in bikes_df.iterrows()}
+    bike_name_to_id = {str(r["name"]): int(r["id"]) for _, r in bikes_df.iterrows()}
 
+    st.subheader("Select riders for this plan")
+    selected_names = st.multiselect(
+        "Pick riders (4â8). You can edit values temporarily below before solving.",
+        options=riders_df["name"].tolist(),
+        default=riders_df["name"].tolist()[:4],
+    )
     if len(selected_names) < 4:
-        st.info("Select at least 4 riders to compute a plan.")
+        st.info("Select at least 4 riders.")
         st.stop()
     if len(selected_names) > 8:
-        st.info("Select no more than 8 riders.")
+        st.info("Max 8 riders.")
         st.stop()
 
-    sel_df = all_db[all_db["name"].isin(selected_names)].copy()
-    sel_df = sel_df.sort_values("name").reset_index(drop=True)
+    # Build selection dataframe with defaults (including default bike)
+    sel = riders_df[riders_df["name"].isin(selected_names)].copy()
+    sel["Bike"] = sel["default_bike_name"].fillna(bike_names[0])
+    sel.loc[~sel["Bike"].isin(bike_names), "Bike"] = bike_names[0]
 
-    st.caption("You can temporarily tweak rider values here before solving (changes are NOT saved to the DB).")
-    tmp_edit = st.data_editor(
-        sel_df.drop(columns=["id"]),
-        use_container_width=True,
+    # Populate bike params from selected bike (but keep editable)
+    sel["Bike_kg"] = sel["Bike"].map(lambda bn: float(bike_name_to_row[bn]["bike_kg"]))
+    sel["Cd"] = sel["Bike"].map(lambda bn: float(bike_name_to_row[bn]["cd"]))
+
+    # Editable: allow temporary changes to height/weight/ftp and bike choice/params
+    st.subheader("Edit selected rider values (temporary overrides)")
+    sel_edit = st.data_editor(
+        sel[["name","height_cm","weight_kg","ftp_w","Bike","Bike_kg","Cd"]],
         hide_index=True,
-        key="tmp_riders_editor",
+        use_container_width=True,
+        column_config={
+            "name": st.column_config.TextColumn("Rider", disabled=True),
+            "height_cm": st.column_config.NumberColumn("Height (cm)", step=1, format="%.0f"),
+            "weight_kg": st.column_config.NumberColumn("Weight (kg)", step=0.1, format="%.1f"),
+            "ftp_w": st.column_config.NumberColumn("FTP (W)", step=1, format="%.0f"),
+            "Bike": st.column_config.SelectboxColumn("Bike", options=bike_names),
+            "Bike_kg": st.column_config.NumberColumn("Bike kg (override)", step=0.1, format="%.1f"),
+            "Cd": st.column_config.NumberColumn("Cd (override)", step=0.001, format="%.3f"),
+        },
+        key="sel_edit",
     )
 
-    # Build Rider objects from edited values
-    riders_raw: List[Rider] = []
-    for _, r in tmp_edit.iterrows():
-        riders_raw.append(
+    # Order rule: strongest -> weakest using estimated cap-speed proxy (includes FTP, CdA, mass)
+    def _solve_front_speed_mps(row) -> float:
+        # Use cap_fraction * FTP, and current crr/rho for ordering.
+        ftp = float(row["ftp_w"])
+        mass = float(row["weight_kg"]) + float(row["Bike_kg"])
+        cd = float(row["Cd"])
+        cda = cd * frontal_area_m2(float(row["weight_kg"]), float(row["height_cm"]))
+        p_cap = float(cap_fraction) * ftp
+
+        lo, hi = 0.0, 30.0
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            p = mid * (mass * G * float(crr)) + 0.5 * float(rho) * cda * (mid ** 3)
+            if p < p_cap:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    sel_edit = sel_edit.copy()
+    sel_edit["__order_score_v"] = sel_edit.apply(_solve_front_speed_mps, axis=1)
+    sel_edit = sel_edit.sort_values("__order_score_v", ascending=False).drop(columns="__order_score_v").reset_index(drop=True)
+
+    st.caption("Rider order is enforced strongest â weakest (based on cap-speed proxy using FTP, CdA, and mass).")
+    st.dataframe(sel_edit[["name","height_cm","weight_kg","ftp_w","Bike","Bike_kg","Cd"]], use_container_width=True, hide_index=True)
+
+    # Draft model editor (default rules; for N>4 positions beyond 4 default to pos4 factor)
+    st.subheader("Draft model (CdA factors by position)")
+    draft_defaults = build_default_draft_factors(len(sel_edit))
+    draft_df = pd.DataFrame({"Position": list(range(1, len(sel_edit)+1)), "CdA factor": draft_defaults})
+    draft_df = st.data_editor(draft_df, use_container_width=True, hide_index=True, key="draft_df")
+    draft_factors = [float(x) for x in draft_df["CdA factor"].tolist()]
+
+    # Build Rider objects for solver
+    riders: List[Rider] = []
+    for _, row in sel_edit.iterrows():
+        riders.append(
             Rider(
-                name=str(r["name"]),
-                height_cm=float(r["height_cm"]),
-                weight_kg=float(r["weight_kg"]),
-                ftp_w=float(r["ftp_w"]),
-                bike_kg=float(r.get("bike_kg", 8.0)),
-                cd=float(r.get("cd", 0.69)),
+                name=str(row["name"]),
+                weight_kg=float(row["weight_kg"]),
+                height_cm=float(row["height_cm"]),
+                ftp_w=float(row["ftp_w"]),
+                bike_kg=float(row["Bike_kg"]),
+                cd=float(row["Cd"]),
             )
         )
 
-    # Order strongest->weakest using FTP + CdA + mass proxy (front-speed at cap fraction)
-    riders = sort_riders_strong_to_weak(riders_raw, cap_fraction=cap_fraction, crr=crr, rho=rho)
-
-    st.subheader("Starting order (strongest â weakest)")
-    order_df = pd.DataFrame(
-        [
-            {
-                "Order": i + 1,
-                "Rider": r.name,
-                "FTP_W": int(round(r.ftp_w)),
-                "Weight_kg": int(round(r.weight_kg)),
-                "Height_cm": int(round(r.height_cm)),
-                "Bike_kg": int(round(r.bike_kg)),
-                "Cd": r.cd,
-                "Area_x1000": int(round(1000.0 * frontal_area_m2(r.weight_kg, r.height_cm))),  # shown as integer
-                "CdA_x1000": int(round(1000.0 * r.cda_front)),
-            }
-            for i, r in enumerate(riders)
-        ]
-    )
-    st.dataframe(order_df, use_container_width=True, hide_index=True)
-
-    st.subheader("Draft factors by position")
-    draft_default = build_default_draft_factors(len(riders))
-    draft_df = pd.DataFrame([{"Position": i + 1, "CdA_factor": float(draft_default[i])} for i in range(len(riders))])
-    draft_df = st.data_editor(draft_df, use_container_width=True, hide_index=True, key="draft_editor")
-    draft_factors = [float(x) for x in draft_df["CdA_factor"].tolist()]
-
-    if st.button("Compute max-speed plan", type="primary"):
+    if st.button("Compute max-speed plan", key="compute_plan"):
         plan = search_max_speed_plan(
             riders=riders,
             crr=float(crr),
@@ -664,116 +986,75 @@ with tabs[0]:
             v_min_kph=float(vmin),
             v_max_kph=float(vmax),
             coarse_step_kph=float(step),
-            refine_iters=18,
+            refine_iters=16,
         )
+
         st.session_state["plan"] = plan
-        st.session_state["riders"] = riders
+        st.session_state["riders_for_plan"] = riders
         st.session_state["draft_factors"] = draft_factors
         st.session_state["env"] = {"crr": float(crr), "rho": float(rho), "cap_fraction": float(cap_fraction)}
+        # reset manual pulls
+        st.session_state.pop("manual_pulls", None)
+        st.session_state.pop("combined_table", None)
+        st.rerun()
 
     if "plan" not in st.session_state:
+        st.info("Compute a plan to see results.")
         st.stop()
 
     plan = st.session_state["plan"]
-    riders = st.session_state["riders"]
+    riders = st.session_state["riders_for_plan"]
     draft_factors = st.session_state["draft_factors"]
-    env = st.session_state["env"]
-    crr = env["crr"]
-    rho = env["rho"]
-    cap_fraction = env["cap_fraction"]
+    crr = st.session_state["env"]["crr"]
+    rho = st.session_state["env"]["rho"]
 
-    st.success(plan["note"])
+    st.success(plan.get("note", "Plan computed."))
     st.metric("Target speed (km/h)", int(round(plan["v_kph"])))
     st.metric("Target speed (m/s)", int(round(plan["v_mps"])))
 
-    # Compute matrices at target speed
     pulls = plan["pulls_s"].copy()
-    P = compute_power_matrix(riders, plan["v_mps"], crr, rho, draft_factors)
+    P = compute_power_matrix(riders, plan["v_mps"], float(crr), float(rho), draft_factors)
     avgW = avg_power_for_pulls(P, pulls)
 
-    st.subheader("Combined rider plan (editable pull times)")
+    st.subheader("Combined rider plan (starting order)")
     df_combined = build_combined_results_table(riders, pulls, P, avgW)
+    st.dataframe(df_combined, use_container_width=True, hide_index=True)
 
-    st.caption("Edit Pull_s to adjust durations manually, then click Recalculate.")
-    df_edit = st.data_editor(
-        df_combined,
-        use_container_width=True,
+    # Manual pull adjustment
+    st.subheader("Manually adjust pull durations (recalculate %FTP etc.)")
+    st.caption("Edits keep the same target speed; the combined table updates to reflect new duty shares.")
+
+    manual_df = pd.DataFrame(
+        [{"Rider": r.name, "Pull_s": int(round(pulls[i]))} for i, r in enumerate(riders)]
+    )
+    manual_edit = st.data_editor(
+        manual_df,
         hide_index=True,
-        key="combined_editor",
+        use_container_width=True,
         column_config={
-            "Pull_s": st.column_config.NumberColumn("Pull_s", min_value=0, step=1),
+            "Rider": st.column_config.TextColumn(disabled=True),
+            "Pull_s": st.column_config.NumberColumn(step=1, format="%d"),
         },
-        disabled=["Order", "Rider", "Pull_W", "DraftAvg_W", "Avg_W", "%FTP"],
+        key="manual_pulls_editor",
     )
 
-    # Streamlit's data_editor doesn't easily allow "only one column editable and compute rest" cleanly,
-    # so we take Pull_s from df_edit and recompute everything when user clicks.
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if st.button("Recalculate with manual pulls"):
-            new_pulls = np.array([float(x) for x in df_edit["Pull_s"].tolist()], dtype=float)
-            new_pulls = np.clip(new_pulls, 0.0, None)
-            if new_pulls.sum() <= 1e-9:
-                st.error("Total pull time is zero. Set at least one rider to a non-zero pull.")
-            else:
-                avgW2 = avg_power_for_pulls(P, new_pulls)
-                df_new = build_combined_results_table(riders, new_pulls, P, avgW2)
-                st.session_state["manual_pulls"] = new_pulls
-                st.session_state["combined_table"] = df_new
-                st.rerun()
+    if st.button("Recalculate with manual pulls", key="recalc_manual"):
+        new_pulls = pulls.copy()
+        for i in range(len(riders)):
+            new_pulls[i] = float(manual_edit.loc[i, "Pull_s"])
+        if new_pulls.sum() <= 0:
+            st.warning("Total rotation time must be > 0.")
+        else:
+            avgW2 = avg_power_for_pulls(P, new_pulls)
+            df_new = build_combined_results_table(riders, new_pulls, P, avgW2)
+            st.session_state["manual_pulls"] = new_pulls
+            st.session_state["combined_table"] = df_new
+            st.rerun()
 
-    with col2:
-        st.caption("Manual pulls keep the same target speed; the table updates %FTP and drafting averages accordingly.")
-
-    # Display recalculated combined table if present
     if "combined_table" in st.session_state and "manual_pulls" in st.session_state:
-        df_out = st.session_state["combined_table"]
-        pulls_used = st.session_state["manual_pulls"]
-        st.dataframe(df_out, use_container_width=True, hide_index=True)
-    else:
-        df_out = df_combined
-        pulls_used = pulls
+        st.subheader("Combined rider plan (after manual pull edits)")
+        st.dataframe(st.session_state["combined_table"], use_container_width=True, hide_index=True)
 
-    # Additional tables (whole numbers)
     st.subheader("Power required by position (whole numbers)")
-    df_pos = build_position_power_table(riders, plan["v_mps"], crr, rho, draft_factors)
+    df_pos = build_position_power_table(riders, plan["v_mps"], float(crr), float(rho), draft_factors)
     st.dataframe(df_pos, use_container_width=True, hide_index=True)
-
-    st.subheader("Rotation timeline (one cycle)")
-    t0 = 0.0
-    timeline = []
-    for k, r in enumerate(riders):
-        dt = float(pulls_used[k])
-        if dt <= 1e-9:
-            continue
-        timeline.append(
-            {
-                "Segment": len(timeline) + 1,
-                "Leader (Pos1)": r.name,
-                "Start_s": int(round(t0)),
-                "End_s": int(round(t0 + dt)),
-                "Duration_s": int(round(dt)),
-            }
-        )
-        t0 += dt
-    st.dataframe(pd.DataFrame(timeline), use_container_width=True, hide_index=True)
-
-    # Constraint check after manual edits
-    st.subheader("Constraint check")
-    ftps = np.array([r.ftp_w for r in riders], dtype=float)
-    avgW_used = avg_power_for_pulls(P, pulls_used)
-    frac_used = avgW_used / ftps
-    chk = pd.DataFrame(
-        [
-            {
-                "Order": i + 1,
-                "Rider": riders[i].name,
-                "Avg_W": int(round(avgW_used[i])),
-                "%FTP": int(round(100.0 * frac_used[i])),
-                "Cap_%FTP": int(round(100.0 * cap_fraction)),
-                "Over_cap": bool(avgW_used[i] > cap_fraction * ftps[i] + 1e-6),
-            }
-            for i in range(len(riders))
-        ]
-    )
-    st.dataframe(chk, use_container_width=True, hide_index=True)
