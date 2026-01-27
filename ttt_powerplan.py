@@ -73,6 +73,7 @@ def build_default_draft_factors(n_riders: int) -> List[float]:
 @dataclass
 class Rider:
     name: str
+    short_name: str | None
     weight_kg: float
     height_cm: float
     ftp_w: float
@@ -86,6 +87,11 @@ class Rider:
     @property
     def cda_front(self) -> float:
         return cda_m2(self.weight_kg, self.height_cm, self.cd)
+
+    @property
+    def display_name(self) -> str:
+        sn = (self.short_name or "").strip()
+        return sn if sn else self.name
 
 
 def position_of_rider_during_lead_segment(i: int, k: int, n: int) -> int:
@@ -337,6 +343,108 @@ def try_find_feasible_pulls(
     return bool(np.all(effortW <= caps + 1e-3)), pulls, effortW, effortW / ftps
 
 
+def balance_pulls_to_target(
+    riders: List[Rider],
+    v_mps: float,
+    crr: float,
+    rho: float,
+    draft_factors: List[float],
+    effort_method: str,
+    cap_fraction: float,
+    strongest_pull_bounds: Tuple[float, float],
+    other_pull_max_s: float,
+    min_pull_s: float,
+    allow_zero_pull: bool,
+    pulls_init: np.ndarray,
+    max_iters: int = 2500,
+    step_s: float = 1.0,
+    tol_frac: float = 0.002,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """Post-process pull times to bring each rider's selected effort metric closer to the target.
+
+    This keeps total rotation time constant and respects pull bounds, by transferring small
+    amounts of pull time from the most 'over' rider to the most 'under' rider.
+    If nobody is over-target, we stop (cannot raise all riders without increasing speed).
+    """
+    n = len(riders)
+    pulls = np.array(pulls_init, dtype=float).copy()
+    P = compute_power_matrix(riders, v_mps, crr, rho, draft_factors)
+    ftps = np.array([r.ftp_w for r in riders], dtype=float)
+    caps = cap_fraction * ftps
+
+    tmin = 0.0 if allow_zero_pull else float(min_pull_s)
+
+    def clamp(i: int):
+        if i == 0:
+            pulls[i] = float(np.clip(pulls[i], strongest_pull_bounds[0], strongest_pull_bounds[1]))
+        else:
+            pulls[i] = float(np.clip(pulls[i], tmin, other_pull_max_s))
+
+    for i in range(n):
+        clamp(i)
+
+    note = "Balanced pull times to match target effort as closely as feasible."
+
+    for _ in range(max_iters):
+        effortW = compute_effort_w_for_pulls(P, pulls, effort_method)
+        frac = effortW / np.maximum(1e-9, ftps)
+        dev = frac - cap_fraction  # >0 means above target
+
+        over = float(np.max(dev))
+        under = float(np.min(dev))
+
+        # If all within tolerance, we're done.
+        if over <= tol_frac and -under <= tol_frac:
+            return pulls, effortW, frac, note
+
+        # If nobody is over target, we can't push everyone up by reallocating time.
+        if over <= 0:
+            note = "All riders are at/below target; cannot bring everyone closer without increasing speed."
+            return pulls, effortW, frac, note
+
+        i_donor = int(np.argmax(dev))
+        i_recv = int(np.argmin(dev))
+
+        donor_min = strongest_pull_bounds[0] if i_donor == 0 else tmin
+        recv_max = strongest_pull_bounds[1] if i_recv == 0 else other_pull_max_s
+
+        if pulls[i_donor] <= donor_min + 1e-9:
+            note = "Balancing stopped: donor rider at minimum pull bound."
+            return pulls, effortW, frac, note
+        if pulls[i_recv] >= recv_max - 1e-9:
+            note = "Balancing stopped: receiver rider at maximum pull bound."
+            return pulls, effortW, frac, note
+
+        delta = min(step_s, pulls[i_donor] - donor_min, recv_max - pulls[i_recv])
+        if delta <= 1e-9:
+            note = "Balancing stopped: no feasible time transfer remaining."
+            return pulls, effortW, frac, note
+
+        pulls[i_donor] -= delta
+        pulls[i_recv] += delta
+        clamp(i_donor)
+        clamp(i_recv)
+
+        # Ensure we didn't introduce a hard cap violation for anyone else. If so, undo and reduce step.
+        effortW2 = compute_effort_w_for_pulls(P, pulls, effort_method)
+        if np.any(effortW2 > caps + 1e-6):
+            pulls[i_donor] += delta
+            pulls[i_recv] -= delta
+            clamp(i_donor)
+            clamp(i_recv)
+            step_s = max(0.25, step_s * 0.5)
+            if step_s <= 0.26:
+                note = "Balancing stopped: further transfers would violate the target cap."
+                effortW = compute_effort_w_for_pulls(P, pulls, effort_method)
+                frac = effortW / np.maximum(1e-9, ftps)
+                return pulls, effortW, frac, note
+
+    effortW = compute_effort_w_for_pulls(P, pulls, effort_method)
+    frac = effortW / np.maximum(1e-9, ftps)
+    note = "Balancing reached iteration limit; showing closest found."
+    return pulls, effortW, frac, note
+
+
 def search_max_speed_plan(
     riders: List[Rider],
     crr: float,
@@ -410,14 +518,30 @@ def search_max_speed_plan(
 
     if last_infeasible is None:
         v, pulls, avgW, frac = best
+        pulls_bal, effortW_bal, frac_bal, bal_note = balance_pulls_to_target(
+            riders=riders,
+            v_mps=v,
+            crr=crr,
+            rho=rho,
+            draft_factors=draft_factors,
+            effort_method=effort_method,
+            cap_fraction=cap_fraction,
+            strongest_pull_bounds=strongest_pull_bounds,
+            other_pull_max_s=other_pull_max_s,
+            min_pull_s=min_pull_s,
+            allow_zero_pull=allow_zero_pull,
+            pulls_init=pulls,
+        )
+        P_bal = compute_power_matrix(riders, v, crr, rho, draft_factors)
+        avgW_bal = avg_power_for_pulls(P_bal, pulls_bal)
         return {
             "feasible": True,
             "v_mps": v,
             "v_kph": 3.6 * v,
-            "pulls_s": pulls,
-            "avgW": avgW,
-            "avgFrac": frac,
-            "note": "Feasible up to the max scanned speed; increase v_max_kph to search further.",
+            "pulls_s": pulls_bal,
+            "avgW": avgW_bal,
+            "avgFrac": frac_bal,
+            "note": "Feasible up to the max scanned speed; increase v_max_kph to search further. " + bal_note,
         }
 
     v_lo, pulls_lo, avgW_lo, frac_lo = last_feasible
@@ -446,57 +570,85 @@ def search_max_speed_plan(
         else:
             v_hi = v_mid
 
+    # Post-balance pull times so riders' selected effort metric is as close as possible to the target.
+    pulls_bal, effortW_bal, frac_bal, bal_note = balance_pulls_to_target(
+        riders=riders,
+        v_mps=v_best,
+        crr=crr,
+        rho=rho,
+        draft_factors=draft_factors,
+        effort_method=effort_method,
+        cap_fraction=cap_fraction,
+        strongest_pull_bounds=strongest_pull_bounds,
+        other_pull_max_s=other_pull_max_s,
+        min_pull_s=min_pull_s,
+        allow_zero_pull=allow_zero_pull,
+        pulls_init=pulls_best,
+    )
+    P_bal = compute_power_matrix(riders, v_best, crr, rho, draft_factors)
+    avgW_bal = avg_power_for_pulls(P_bal, pulls_bal)
+
     return {
         "feasible": True,
         "v_mps": v_best,
         "v_kph": 3.6 * v_best,
-        "pulls_s": pulls_best,
-        "avgW": avgW_best,
-        "avgFrac": frac_best,
-        "note": "Max-speed feasible plan (per the heuristic solver).",
+        "pulls_s": pulls_bal,
+        "avgW": avgW_bal,
+        "avgFrac": frac_bal,
+        "note": "Max-speed feasible plan (solver) + " + bal_note,
     }
 
 
 # =============================
 # Results table helpers
 # =============================
-def build_combined_results_table(riders: List[Rider], pulls: np.ndarray, P: np.ndarray, avgW: np.ndarray, effortW: np.ndarray, effort_method: str) -> pd.DataFrame:
+def build_powerplan_table(
+    riders: List[Rider],
+    pulls_s: np.ndarray,
+    P: np.ndarray,
+    effortW: np.ndarray,
+    effort_method: str,
+) -> pd.DataFrame:
+    """Return the main power-plan table (same fields as the PNG card).
+
+    Uses riders' short names for display (column title remains 'Rider Name').
+    The 'Overall' column reflects the selected effort_method (Average / NP / XP).
     """
-    Combined table (starting order):
-      - Pull time
-      - Pull (front) power
-      - Avg drafting power (time-weighted over non-front segments)
-      - Overall avg power
-      - %FTP
-    Displayed as whole numbers.
-    """
-    effort_key = {'NP':'NP','XP':'XP','Average':'AVG'}.get(effort_method, (effort_method or 'EFF').upper())
+    label = {"NP": "NP", "XP": "XP", "AVERAGE": "Avg"}.get((effort_method or "Average").strip().upper(), str(effort_method))
     n = len(riders)
-    T = float(pulls.sum())
+    T = float(np.sum(pulls_s))
     rows = []
+
+    weights = np.array([r.weight_kg for r in riders], dtype=float)
+
     for i, r in enumerate(riders):
-        t_front = float(pulls[i])
-        p_front = float(P[i, i])  # during segment where rider i leads
+        t_front = float(pulls_s[i])
+        p_front = float(P[i, i])
 
         t_draft = max(0.0, T - t_front)
         if t_draft > 1e-9:
-            draft_work = float(np.dot(pulls, P[i, :]) - t_front * p_front)
-            p_draft_avg = draft_work / t_draft
+            work_total = float(np.dot(pulls_s, P[i, :]))
+            work_front = t_front * p_front
+            p_draft = (work_total - work_front) / t_draft
         else:
-            p_draft_avg = 0.0
+            p_draft = 0.0
+
+        overall = float(effortW[i])
+        ftp = float(r.ftp_w)
 
         rows.append(
             {
-                "Order": i + 1,
-                "Rider": r.name,
-                "Pull_s": int(round(t_front)),
-                "Pull_W": int(round(p_front)),
-                "DraftAvg_W": int(round(p_draft_avg)),
-                "Avg_W": int(round(float(avgW[i]))),
-                f"{effort_key}_W": int(round(float(effortW[i]))),
-                f"{effort_key}_%FTP": round(100.0 * float(effortW[i]) / float(r.ftp_w), 1),
+                "Rider Name": r.display_name,
+                "Front Interval": f"{int(round(t_front))} secs",
+                "Front Power": int(round(p_front)),
+                "Front wkg": round(p_front / max(1e-9, float(r.weight_kg)), 1),
+                "Drafting Avg Power": int(round(p_draft)),
+                "Drafting wkg": round(p_draft / max(1e-9, float(r.weight_kg)), 1),
+                f"Overall {label} Power": int(round(overall)),
+                f"{label} % FTP": round(100.0 * overall / max(1e-9, ftp), 1),
             }
         )
+
     return pd.DataFrame(rows)
 
 
@@ -793,7 +945,7 @@ def ensure_db() -> None:
     last_err = None
     for attempt in range(8):
         try:
-            init_db()
+            ensure_db()
             st.session_state["_db_ready"] = True
             return
         except sqlite3.OperationalError as e:
@@ -807,7 +959,7 @@ def ensure_db() -> None:
 
 
 def fetch_bikes_df() -> pd.DataFrame:
-    init_db()
+    ensure_db()
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT id, name, bike_kg, cd FROM bikes ORDER BY name ASC"
@@ -1280,7 +1432,7 @@ with tabs[0]:
     with st.sidebar:
         st.subheader("Environment / Model")
         crr = st.number_input("CRR", value=0.004, step=0.0005, format="%.4f")
-        rho = st.number_input("Air density ÃÂÃÂ (kg/mÃÂÃÂ³)", value=1.214, step=0.01, format="%.3f")
+        rho = st.number_input("Air density ÃÂÃÂÃÂÃÂ (kg/mÃÂÃÂÃÂÃÂ³)", value=1.214, step=0.01, format="%.3f")
 
         st.subheader("Constraints")
         effort_method = st.selectbox("Effort metric (constraint & reporting)", ["NP", "XP", "Average"], index=0)
@@ -1314,7 +1466,7 @@ with tabs[0]:
 
     st.subheader("Select riders for this plan")
     selected_names = st.multiselect(
-        "Pick riders (4ÃÂ¢ÃÂÃÂ8). You can edit values temporarily below before solving.",
+        "Pick riders (4ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ8). You can edit values temporarily below before solving.",
         options=riders_df["name"].tolist(),
         default=riders_df["name"].tolist()[:4],
     )
@@ -1342,11 +1494,12 @@ with tabs[0]:
 
     st.caption("Edit selected rider values (temporary overrides)")
     sel_edit = st.data_editor(
-        sel[["name","height_cm","weight_kg","p20_w","ftp_w","Bike","Bike_kg","Cd"]],
+        sel[["name","short_name","height_cm","weight_kg","p20_w","ftp_w","Bike","Bike_kg","Cd"]],
         hide_index=True,
         use_container_width=True,
         column_config={
             "name": st.column_config.TextColumn("Rider", disabled=True),
+            "short_name": st.column_config.TextColumn("Short", disabled=True),
             "height_cm": st.column_config.NumberColumn("Height (cm)", step=1, format="%.0f"),
             "weight_kg": st.column_config.NumberColumn("Weight (kg)", step=0.1, format="%.1f"),
             "p20_w": st.column_config.NumberColumn("20 min max (W)", step=1, format="%.0f"),
@@ -1384,7 +1537,7 @@ with tabs[0]:
     sel_edit["__order_score_v"] = sel_edit.apply(_solve_front_speed_mps, axis=1)
     sel_edit = sel_edit.sort_values("__order_score_v", ascending=False).drop(columns="__order_score_v").reset_index(drop=True)
 
-    st.caption("Rider order is enforced strongest ÃÂ¢ÃÂÃÂ weakest (based on cap-speed proxy using FTP, CdA, and mass).")
+    st.caption("Rider order is enforced strongest ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ weakest (based on cap-speed proxy using FTP, CdA, and mass).")
     st.dataframe(sel_edit[["name","height_cm","weight_kg","ftp_w","Bike","Bike_kg","Cd"]], use_container_width=True, hide_index=True)
 
     # Draft model editor (default rules; for N>4 positions beyond 4 default to pos4 factor)
@@ -1400,6 +1553,7 @@ with tabs[0]:
         riders.append(
             Rider(
                 name=str(row["name"]),
+                short_name=(str(row.get("short_name", "")).strip() or None),
                 weight_kg=float(row["weight_kg"]),
                 height_cm=float(row["height_cm"]),
                 ftp_w=float(row["ftp_w"]),
@@ -1455,7 +1609,7 @@ with tabs[0]:
     effortW = compute_effort_w_for_pulls(P, pulls, effort_method)
 
     st.subheader("Combined rider plan (starting order)")
-    df_combined = build_combined_results_table(riders, pulls, P, avgW, effortW, effort_method)
+    df_combined = build_powerplan_table(riders, pulls, P, effortW, effort_method)
     st.dataframe(df_combined, use_container_width=True, hide_index=True)
 
     # Presentation table (matches your preferred layout) + PNG export
@@ -1466,31 +1620,27 @@ with tabs[0]:
     if "combined_table" in st.session_state and "manual_pulls" in st.session_state:
         df_for_card = st.session_state["combined_table"]
 
-    # Build card-style table
-    # Expect df_for_card has columns: Rider, Pull_s, Pull_W, DraftAvg_W, and NP_W/XP_W + NP_%FTP/XP_%FTP
-    effort_col_w = None
-    effort_col_pct = None
-    for c in df_for_card.columns:
-        if c.endswith("_W") and c not in ("Avg_W", "Pull_W", "DraftAvg_W"):
-            effort_col_w = c
-        if c.endswith("_%FTP"):
-            effort_col_pct = c
+    # Build PNG-card table using the same fields as the main results table (just with wrapped headers).
+    overall_col = next((c for c in df_for_card.columns if str(c).startswith("Overall ") and str(c).endswith(" Power")), None)
+    pct_col = next((c for c in df_for_card.columns if str(c).endswith("% FTP")), None)
 
-    if effort_col_w is None or effort_col_pct is None:
-        st.warning("Card export unavailable: could not find effort columns in the combined table.")
+    if overall_col is None or pct_col is None:
+        st.warning("Card export unavailable: could not find Overall/%%FTP columns in the results table.")
     else:
-        effort_method_label = {"NP":"NP","XP":"XP","Average":"Avg"}.get(effort_method, str(effort_method))
-        df_card = pd.DataFrame({
-            "Rider\nOrder": df_for_card["Rider"].astype(str),
-            "Front\nInterval": df_for_card["Pull_s"].astype(int).astype(str) + " secs",
-            "Front\nPower": df_for_card["Pull_W"].astype(int),
-            "Front\nwkg": (df_for_card["Pull_W"].astype(float) / np.maximum(1e-9, np.array([r.weight_kg for r in riders], dtype=float))).round(1),
-            "Drafting\nAvg Power": df_for_card["DraftAvg_W"].astype(int),
-            "Drafting\nwkg": (df_for_card["DraftAvg_W"].astype(float) / np.maximum(1e-9, np.array([r.weight_kg for r in riders], dtype=float))).round(1),
-            f"Overall\n{effort_method_label} Power": df_for_card[effort_col_w].astype(int),
-            f"{effort_method_label}\n% FTP": df_for_card[effort_col_pct].astype(float).round(1),
-        })
+        # Derive label from columns (Avg / NP / XP) so naming always matches the selected mode.
+        # overall_col is like: 'Overall NP Power' or 'Overall Avg Power'
+        label = str(overall_col).replace("Overall ", "").replace(" Power", "").strip()
 
+        df_card = pd.DataFrame({
+            "Rider\nName": df_for_card["Rider Name"].astype(str),
+            "Front\nInterval": df_for_card["Front Interval"].astype(str),
+            "Front\nPower": df_for_card["Front Power"].astype(int),
+            "Front\nwkg": df_for_card["Front wkg"].astype(float).round(1),
+            "Drafting\nAvg Power": df_for_card["Drafting Avg Power"].astype(int),
+            "Drafting\nwkg": df_for_card["Drafting wkg"].astype(float).round(1),
+            f"Overall\n{label} Power": df_for_card[overall_col].astype(int),
+            f"{label}\n% FTP": df_for_card[pct_col].astype(float).round(1),
+        })
         png_bytes = plan_table_png(df_card)
 
         st.image(png_bytes, use_container_width=True)
@@ -1535,7 +1685,7 @@ with tabs[0]:
         else:
             avgW2 = avg_power_for_pulls(P, new_pulls)
             effortW2 = compute_effort_w_for_pulls(P, new_pulls, effort_method)
-            df_new = build_combined_results_table(riders, new_pulls, P, avgW2, effortW2, effort_method)
+            df_new = build_powerplan_table(riders, new_pulls, P, effortW2, effort_method)
             st.session_state["manual_pulls"] = new_pulls
             st.session_state["combined_table"] = df_new
             st.rerun()
