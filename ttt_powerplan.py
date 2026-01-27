@@ -1,4 +1,3 @@
-# ttt_powerplan.py
 # Streamlit app: Zwift TTT pull & power planner + local rider database (SQLite)
 #
 # Run:
@@ -72,11 +71,14 @@ def build_default_draft_factors(n_riders: int) -> List[float]:
 # =============================
 @dataclass
 class Rider:
+    # Non-default fields first (required)
     name: str
-    short_name: str | None = None
     weight_kg: float
     height_cm: float
     ftp_w: float
+
+    # Optional / defaulted fields after
+    short_name: str | None = None
     bike_kg: float = 8.0
     cd: float = 0.69
 
