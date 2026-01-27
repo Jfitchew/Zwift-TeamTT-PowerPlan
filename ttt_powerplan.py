@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import math
 import sqlite3
-import io
 import time
+import io
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -210,110 +210,6 @@ def compute_effort_w_for_pulls(P: np.ndarray, pulls_s: np.ndarray, method: str) 
             # Fallback
             out[i] = float(cycle.mean())
 
-
-def balance_pulls_to_targets(
-    P: np.ndarray,
-    pulls: np.ndarray,
-    method: str,
-    ftps: np.ndarray,
-    cap_fraction: float,
-    strongest_pull_bounds: Tuple[float, float],
-    other_pull_max_s: float,
-    min_pull_s: float,
-    allow_zero_pull: bool,
-    iters: int = 600,
-    step_s: float = 1.0,
-) -> np.ndarray:
-    """Heuristic rebalancing at fixed speed.
-
-    Moves small amounts of pull time from the most 'strained' rider (highest metric/target)
-    to the least strained rider, while keeping total rotation time constant and respecting
-    pull duration bounds. This tends to bring all riders' selected metric (Avg/NP/XP) closer
-    to cap_fraction * FTP, improving fairness and making the plan better match the chosen mode.
-    """
-    n = len(pulls)
-    if n <= 1:
-        return pulls
-
-    pulls = pulls.astype(float).copy()
-    tmin = 0.0 if allow_zero_pull else float(min_pull_s)
-
-    def clamp(i: int) -> None:
-        if i == 0:
-            pulls[i] = float(np.clip(pulls[i], strongest_pull_bounds[0], strongest_pull_bounds[1]))
-        else:
-            pulls[i] = float(np.clip(pulls[i], tmin, float(other_pull_max_s)))
-
-    for i in range(n):
-        clamp(i)
-
-    target = cap_fraction * ftps
-
-    def score(eff: np.ndarray) -> float:
-        # mean absolute relative error to target
-        rel = eff / np.maximum(1e-9, target)
-        return float(np.mean(np.abs(rel - 1.0)))
-
-    eff = compute_effort_w_for_pulls(P, pulls, method)
-    best_score = score(eff)
-
-    for _ in range(iters):
-        eff = compute_effort_w_for_pulls(P, pulls, method)
-        rel = eff / np.maximum(1e-9, target)
-
-        i_hi = int(np.argmax(rel))
-        i_lo = int(np.argmin(rel))
-
-        if i_hi == i_lo:
-            break
-
-        # If already reasonably close, stop.
-        if best_score <= 0.003:  # ~0.3% mean error
-            break
-
-        # Determine if we can move time.
-        hi_min = strongest_pull_bounds[0] if i_hi == 0 else tmin
-        lo_max = strongest_pull_bounds[1] if i_lo == 0 else float(other_pull_max_s)
-
-        if pulls[i_hi] <= hi_min + 1e-9 or pulls[i_lo] >= lo_max - 1e-9:
-            break
-
-        delta = min(float(step_s), pulls[i_hi] - hi_min, lo_max - pulls[i_lo])
-        if delta <= 1e-9:
-            break
-
-        # Propose move: take from hi, give to lo
-        pulls[i_hi] -= delta
-        pulls[i_lo] += delta
-        clamp(i_hi)
-        clamp(i_lo)
-
-        eff2 = compute_effort_w_for_pulls(P, pulls, method)
-
-        # Keep feasibility: do not exceed target by more than tiny tolerance
-        if np.any(eff2 - target > 0.5):  # allow small numerical wobble, 0.5 W headroom
-            # revert
-            pulls[i_hi] += delta
-            pulls[i_lo] -= delta
-            clamp(i_hi)
-            clamp(i_lo)
-            # reduce step gradually
-            step_s = max(0.25, step_s * 0.7)
-            continue
-
-        s2 = score(eff2)
-        if s2 + 1e-9 < best_score:
-            best_score = s2
-        else:
-            # revert if no improvement
-            pulls[i_hi] += delta
-            pulls[i_lo] -= delta
-            clamp(i_hi)
-            clamp(i_lo)
-            step_s = max(0.25, step_s * 0.7)
-
-    return pulls
-
     return out
 
 # =============================
@@ -405,22 +301,6 @@ def try_find_feasible_pulls(
         effortW = compute_effort_w_for_pulls(P, pulls, effort_method)
         viol = effortW - caps
         if np.all(viol <= 1e-6):
-            # Optional balancing: redistribute pull time to bring riders' chosen metric (Avg/NP/XP)
-            # closer to the target cap_fraction across the whole team, not just <= cap.
-            pulls = balance_pulls_to_targets(
-                P=P,
-                pulls=pulls,
-                method=effort_method,
-                ftps=ftps,
-                cap_fraction=cap_fraction,
-                strongest_pull_bounds=strongest_pull_bounds,
-                other_pull_max_s=other_pull_max_s,
-                min_pull_s=min_pull_s,
-                allow_zero_pull=allow_zero_pull,
-                iters=600,
-                step_s=1.0,
-            )
-            effortW = compute_effort_w_for_pulls(P, pulls, effort_method)
             return True, pulls, effortW, effortW / ftps
 
         i_bad = int(np.argmax(viol))
@@ -608,7 +488,7 @@ def build_combined_results_table(riders: List[Rider], pulls: np.ndarray, P: np.n
         rows.append(
             {
                 "Order": i + 1,
-                "Rider Name": (r.short_name if getattr(r, "short_name", None) else r.name),
+                "Rider": r.name,
                 "Pull_s": int(round(t_front)),
                 "Pull_W": int(round(p_front)),
                 "DraftAvg_W": int(round(p_draft_avg)),
@@ -624,7 +504,7 @@ def build_position_power_table(riders: List[Rider], v_mps: float, crr: float, rh
     n = len(riders)
     rows = []
     for r in riders:
-        row = {"Rider Name": (r.short_name if getattr(r, "short_name", None) else r.name), "FTP_W": int(round(r.ftp_w))}
+        row = {"Rider": r.name, "FTP_W": int(round(r.ftp_w))}
         for pos in range(1, n + 1):
             cda_eff = r.cda_front * float(draft_factors[pos - 1])
             row[f"Pos{pos}_W"] = int(round(power_required_w(v_mps, r.system_mass_kg, crr, rho, cda_eff)))
@@ -746,188 +626,188 @@ def db_path() -> Path:
 
 
 def get_conn() -> sqlite3.Connection:
-    """SQLite connection configured to be resilient on Streamlit Cloud."""
-    conn = sqlite3.connect(
-        str(db_path()),
-        timeout=30,              # seconds
-        check_same_thread=False,
-    )
+    # Use a long timeout and WAL mode to reduce 'database is locked' on Streamlit Cloud
+    conn = sqlite3.connect(str(db_path()), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-
-    # Pragmas for concurrency + safety
     conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")     # allow readers during writes
-    conn.execute("PRAGMA synchronous = NORMAL;")
-    conn.execute("PRAGMA busy_timeout = 30000;")   # ms
-
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")  # ms
     return conn
-
-
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
     return [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
 
 
 def init_db() -> None:
-    """Create tables and migrate schemas. Robust to Streamlit Cloud locking."""
-    for attempt in range(6):
+    """Create tables and migrate from older single-table schema if detected."""
+    with get_conn() as conn:
+        # Bikes table
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bikes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                bike_kg REAL NOT NULL DEFAULT 8,
+                cd REAL NOT NULL DEFAULT 0.69
+            )
+            """
+        )
+
+        # Detect if an older riders table exists and contains bike_kg/cd directly
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS riders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                short_name TEXT,
+                height_cm REAL NOT NULL,
+                weight_kg REAL NOT NULL,
+                p20_w REAL NOT NULL,
+                ftp_w REAL NOT NULL,
+                effective_max_hr REAL,
+                strava_url TEXT,
+                zwiftpower_url TEXT,
+                default_bike_id INTEGER,
+                FOREIGN KEY(default_bike_id) REFERENCES bikes(id) ON DELETE SET NULL
+            )
+            """
+        )
+        # Migration: if riders table has legacy columns bike_kg and cd, migrate to bikes table.
+        cols = _table_columns(conn, "riders")
+        if ("bike_kg" in cols) or ("cd" in cols):
+            # Create a new riders table with correct schema
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS riders_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    short_name TEXT,
+                    height_cm REAL NOT NULL,
+                    weight_kg REAL NOT NULL,
+                    p20_w REAL NOT NULL,
+                    ftp_w REAL NOT NULL,
+                    effective_max_hr REAL,
+                    strava_url TEXT,
+                    zwiftpower_url TEXT,
+                    default_bike_id INTEGER,
+                    FOREIGN KEY(default_bike_id) REFERENCES bikes(id) ON DELETE SET NULL
+                )
+                """
+            )
+            # Collect unique bikes from old rider rows
+            old_rows = conn.execute(
+                "SELECT name, height_cm, weight_kg, ftp_w, bike_kg, cd FROM riders"
+            ).fetchall()
+
+            bike_map: Dict[Tuple[float, float], int] = {}
+            for r in old_rows:
+                bk = float(r["bike_kg"]) if r["bike_kg"] is not None else 8.0
+                cdv = float(r["cd"]) if r["cd"] is not None else 0.69
+                key = (round(bk, 3), round(cdv, 4))
+                if key not in bike_map:
+                    # Ensure unique bike name
+                    base = f"Imported {key[0]:g}kg Cd {key[1]:g}"
+                    name = base
+                    suffix = 2
+                    while True:
+                        try:
+                            conn.execute(
+                                "INSERT INTO bikes(name, bike_kg, cd) VALUES (?,?,?)",
+                                (name, key[0], key[1]),
+                            )
+                            bike_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                            bike_map[key] = bike_id
+                            break
+                        except sqlite3.IntegrityError:
+                            name = f"{base} ({suffix})"
+                            suffix += 1
+
+            # Insert riders into new table
+            for r in old_rows:
+                key = (round(float(r["bike_kg"]), 3), round(float(r["cd"]), 4))
+                bike_id = bike_map.get(key)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO riders_new(name, short_name, height_cm, weight_kg, p20_w, ftp_w, effective_max_hr, strava_url, zwiftpower_url, default_bike_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (r["name"], None, float(r["height_cm"]), float(r["weight_kg"]), float(r["ftp_w"]) / 0.95, float(r["ftp_w"]), None, None, None, bike_id),
+                )
+
+            # Replace old table
+            conn.execute("DROP TABLE riders")
+            conn.execute("ALTER TABLE riders_new RENAME TO riders")
+
+        # Migration: add extended rider fields and 20-min power based FTP if missing.
+        cols = _table_columns(conn, "riders")
+        # Add missing columns (SQLite supports ADD COLUMN).
+        def _add_col(sql: str):
+            try:
+                conn.execute(sql)
+            except Exception:
+                pass
+
+        if "short_name" not in cols:
+            _add_col("ALTER TABLE riders ADD COLUMN short_name TEXT")
+        if "p20_w" not in cols:
+            _add_col("ALTER TABLE riders ADD COLUMN p20_w REAL")
+        if "effective_max_hr" not in cols:
+            _add_col("ALTER TABLE riders ADD COLUMN effective_max_hr REAL")
+        if "strava_url" not in cols:
+            _add_col("ALTER TABLE riders ADD COLUMN strava_url TEXT")
+        if "zwiftpower_url" not in cols:
+            _add_col("ALTER TABLE riders ADD COLUMN zwiftpower_url TEXT")
+
+        cols = _table_columns(conn, "riders")
+        # If ftp_w exists but p20_w is null, backfill p20_w = ftp_w / 0.95
+        if "ftp_w" in cols and "p20_w" in cols:
+            conn.execute(
+                "UPDATE riders SET p20_w = COALESCE(p20_w, ftp_w / 0.95) WHERE p20_w IS NULL"
+            )
+            # Ensure ftp_w matches 0.95*p20_w going forward
+            conn.execute(
+                "UPDATE riders SET ftp_w = 0.95 * p20_w WHERE p20_w IS NOT NULL"
+            )
+
+
+        # Ensure at least one bike exists
+        n_bikes = conn.execute("SELECT COUNT(*) AS n FROM bikes").fetchone()["n"]
+        if n_bikes == 0:
+            conn.execute("INSERT INTO bikes(name, bike_kg, cd) VALUES (?,?,?)", ("Default", 8.0, 0.69))
+
+        conn.commit()
+
+
+
+
+def ensure_db() -> None:
+    """Initialise/migrate the DB once per Streamlit session, with retry/backoff.
+
+    Streamlit reruns the script often; calling DDL repeatedly is a common cause
+    of 'database is locked' on Streamlit Cloud.
+    """
+    if st.session_state.get("_db_ready", False):
+        return
+
+    last_err = None
+    for attempt in range(8):
         try:
-            with get_conn() as conn:
-                # Bikes table
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS bikes (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL UNIQUE,
-                        bike_kg REAL NOT NULL DEFAULT 8,
-                        cd REAL NOT NULL DEFAULT 0.69
-                    )
-                    """
-                )
-
-                # Detect if an older riders table exists and contains bike_kg/cd directly
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS riders (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL UNIQUE,
-                        short_name TEXT,
-                        height_cm REAL NOT NULL,
-                        weight_kg REAL NOT NULL,
-                        p20_w REAL NOT NULL,
-                        ftp_w REAL NOT NULL,
-                        effective_max_hr REAL,
-                        strava_url TEXT,
-                        zwiftpower_url TEXT,
-                        default_bike_id INTEGER,
-                        FOREIGN KEY(default_bike_id) REFERENCES bikes(id) ON DELETE SET NULL
-                    )
-                    """
-                )
-                # Migration: if riders table has legacy columns bike_kg and cd, migrate to bikes table.
-                cols = _table_columns(conn, "riders")
-                if ("bike_kg" in cols) or ("cd" in cols):
-                    # Create a new riders table with correct schema
-                    conn.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS riders_new (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            name TEXT NOT NULL UNIQUE,
-                            short_name TEXT,
-                            height_cm REAL NOT NULL,
-                            weight_kg REAL NOT NULL,
-                            p20_w REAL NOT NULL,
-                            ftp_w REAL NOT NULL,
-                            effective_max_hr REAL,
-                            strava_url TEXT,
-                            zwiftpower_url TEXT,
-                            default_bike_id INTEGER,
-                            FOREIGN KEY(default_bike_id) REFERENCES bikes(id) ON DELETE SET NULL
-                        )
-                        """
-                    )
-                    # Collect unique bikes from old rider rows
-                    old_rows = conn.execute(
-                        "SELECT name, height_cm, weight_kg, ftp_w, bike_kg, cd FROM riders"
-                    ).fetchall()
-
-                    bike_map: Dict[Tuple[float, float], int] = {}
-                    for r in old_rows:
-                        bk = float(r["bike_kg"]) if r["bike_kg"] is not None else 8.0
-                        cdv = float(r["cd"]) if r["cd"] is not None else 0.69
-                        key = (round(bk, 3), round(cdv, 4))
-                        if key not in bike_map:
-                            # Ensure unique bike name
-                            base = f"Imported {key[0]:g}kg Cd {key[1]:g}"
-                            name = base
-                            suffix = 2
-                            while True:
-                                try:
-                                    conn.execute(
-                                        "INSERT INTO bikes(name, bike_kg, cd) VALUES (?,?,?)",
-                                        (name, key[0], key[1]),
-                                    )
-                                    bike_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-                                    bike_map[key] = bike_id
-                                    break
-                                except sqlite3.IntegrityError:
-                                    name = f"{base} ({suffix})"
-                                    suffix += 1
-
-                    # Insert riders into new table
-                    for r in old_rows:
-                        key = (round(float(r["bike_kg"]), 3), round(float(r["cd"]), 4))
-                        bike_id = bike_map.get(key)
-                        conn.execute(
-                            """
-                            INSERT OR REPLACE INTO riders_new(name, short_name, height_cm, weight_kg, p20_w, ftp_w, effective_max_hr, strava_url, zwiftpower_url, default_bike_id)
-                            VALUES (?,?,?,?,?,?,?,?,?,?)
-                            """,
-                            (r["name"], None, float(r["height_cm"]), float(r["weight_kg"]), float(r["ftp_w"]) / 0.95, float(r["ftp_w"]), None, None, None, bike_id),
-                        )
-
-                    # Replace old table
-                    conn.execute("DROP TABLE riders")
-                    conn.execute("ALTER TABLE riders_new RENAME TO riders")
-
-                # Migration: add extended rider fields and 20-min power based FTP if missing.
-                cols = _table_columns(conn, "riders")
-                # Add missing columns (SQLite supports ADD COLUMN).
-                def _add_col(sql: str):
-                    try:
-                        conn.execute(sql)
-                    except Exception:
-                        pass
-
-                if "short_name" not in cols:
-                    _add_col("ALTER TABLE riders ADD COLUMN short_name TEXT")
-                if "p20_w" not in cols:
-                    _add_col("ALTER TABLE riders ADD COLUMN p20_w REAL")
-                if "effective_max_hr" not in cols:
-                    _add_col("ALTER TABLE riders ADD COLUMN effective_max_hr REAL")
-                if "strava_url" not in cols:
-                    _add_col("ALTER TABLE riders ADD COLUMN strava_url TEXT")
-                if "zwiftpower_url" not in cols:
-                    _add_col("ALTER TABLE riders ADD COLUMN zwiftpower_url TEXT")
-
-                cols = _table_columns(conn, "riders")
-                # If ftp_w exists but p20_w is null, backfill p20_w = ftp_w / 0.95
-                if "ftp_w" in cols and "p20_w" in cols:
-                    conn.execute(
-                        "UPDATE riders SET p20_w = COALESCE(p20_w, ftp_w / 0.95) WHERE p20_w IS NULL"
-                    )
-                    # Ensure ftp_w matches 0.95*p20_w going forward
-                    conn.execute(
-                        "UPDATE riders SET ftp_w = 0.95 * p20_w WHERE p20_w IS NOT NULL"
-                    )
-
-
-                # Ensure at least one bike exists
-                n_bikes = conn.execute("SELECT COUNT(*) AS n FROM bikes").fetchone()["n"]
-                if n_bikes == 0:
-                    conn.execute("INSERT INTO bikes(name, bike_kg, cd) VALUES (?,?,?)", ("Default", 8.0, 0.69))
-
-                conn.commit()
-                return
+            init_db()
+            st.session_state["_db_ready"] = True
+            return
         except sqlite3.OperationalError as e:
+            last_err = e
             if "locked" in str(e).lower():
                 time.sleep(0.25 * (attempt + 1))
                 continue
             raise
-    raise RuntimeError("Database initialisation failed (database is locked).")
-
-
-def ensure_db() -> None:
-    """Ensure DB is initialised once per Streamlit session."""
-    if st.session_state.get("_db_inited", False):
-        return
-    ensure_db()
-    st.session_state["_db_inited"] = True
-
+    # If we get here, the DB stayed locked for too long.
+    raise sqlite3.OperationalError(f"Database is locked (after retries): {last_err}")
 
 
 def fetch_bikes_df() -> pd.DataFrame:
-    ensure_db()
+    init_db()
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT id, name, bike_kg, cd FROM bikes ORDER BY name ASC"
@@ -1238,10 +1118,6 @@ def import_riders_xlsx(xlsx_bytes: bytes, sheet_name: str | None = None) -> Tupl
             errors.append(f"{r.get('name','<blank>')}: {e}")
     return count, errors
 st.set_page_config(page_title="Zwift TTT Power Plan", layout="wide")
-
-# Ensure DB schema exists (runs once per session)
-ensure_db()
-
 st.title("Zwift Indoor Team Time Trial Pull & Power Planner")
 
 ensure_db()
@@ -1578,8 +1454,10 @@ with tabs[0]:
     effort_method = st.session_state["env"].get("effort_method", "NP")
     effortW = compute_effort_w_for_pulls(P, pulls, effort_method)
 
-    st.subheader("Power plan (table)")
+    st.subheader("Combined rider plan (starting order)")
     df_combined = build_combined_results_table(riders, pulls, P, avgW, effortW, effort_method)
+    st.dataframe(df_combined, use_container_width=True, hide_index=True)
+
     # Presentation table (matches your preferred layout) + PNG export
     st.subheader("Power plan card (export)")
     st.caption("This is a compact, shareable table view (PNG), using the current pulls (manual edits included if applied).")
@@ -1603,7 +1481,7 @@ with tabs[0]:
     else:
         effort_method_label = {"NP":"NP","XP":"XP","Average":"Avg"}.get(effort_method, str(effort_method))
         df_card = pd.DataFrame({
-            "Rider\nName": df_for_card["Rider Name"].astype(str),
+            "Rider\nOrder": df_for_card["Rider"].astype(str),
             "Front\nInterval": df_for_card["Pull_s"].astype(int).astype(str) + " secs",
             "Front\nPower": df_for_card["Pull_W"].astype(int),
             "Front\nwkg": (df_for_card["Pull_W"].astype(float) / np.maximum(1e-9, np.array([r.weight_kg for r in riders], dtype=float))).round(1),
@@ -1612,11 +1490,6 @@ with tabs[0]:
             f"Overall\n{effort_method_label} Power": df_for_card[effort_col_w].astype(int),
             f"{effort_method_label}\n% FTP": df_for_card[effort_col_pct].astype(float).round(1),
         })
-
-        # Show the same fields as the PNG card in a normal table as well
-        df_display = df_card.copy()
-        df_display.columns = [c.replace("\n", " ") for c in df_display.columns]
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
 
         png_bytes = plan_table_png(df_card)
 
@@ -1640,7 +1513,7 @@ with tabs[0]:
     st.caption("Edits keep the same target speed; the combined table updates to reflect new duty shares.")
 
     manual_df = pd.DataFrame(
-        [{"Rider Name": (r.short_name if getattr(r, "short_name", None) else r.name), "Pull_s": int(round(pulls[i]))} for i, r in enumerate(riders)]
+        [{"Rider": r.name, "Pull_s": int(round(pulls[i]))} for i, r in enumerate(riders)]
     )
     manual_edit = st.data_editor(
         manual_df,
