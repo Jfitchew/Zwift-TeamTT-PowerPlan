@@ -20,6 +20,8 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from io import BytesIO
+import json
+from datetime import datetime, timezone
 
 G = 9.80665
 
@@ -944,6 +946,24 @@ def init_db() -> None:
         if n_bikes == 0:
             conn.execute("INSERT INTO bikes(name, bike_kg, cd) VALUES (?,?,?)", ("Default", 8.0, 0.69))
 
+        # Saved power plans (snapshot riders + inputs + outputs)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                created_at_iso TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+
+        # Simple index for listing
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_saved_plans_created_at ON saved_plans(created_at_iso)")
+        except Exception:
+            pass
+
         conn.commit()
 
 
@@ -1118,6 +1138,75 @@ def delete_rider_by_name(name: str) -> None:
         conn.execute("DELETE FROM riders WHERE name=?", (name.strip(),))
         conn.commit()
         bump_db_version()
+
+
+# =============================
+# Saved plans (snapshots)
+# =============================
+def _utc_now_iso() -> str:
+    # ISO with seconds, UTC (portable, unambiguous)
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def save_power_plan(title: str, payload: dict) -> int:
+    """Persist a power plan snapshot.
+
+    payload should contain everything needed to re-display the plan later
+    without touching the live riders DB (rider stats may change).
+    """
+    ensure_db()
+    title = (title or "").strip()
+    if not title:
+        raise ValueError("Plan title cannot be empty")
+
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO saved_plans(title, created_at_iso, payload_json) VALUES (?,?,?)",
+            (title, _utc_now_iso(), json.dumps(payload, ensure_ascii=False)),
+        )
+        new_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.commit()
+    bump_db_version()
+    return new_id
+
+
+@st.cache_data(show_spinner=False)
+def _list_saved_plans_cached(db_version: int) -> pd.DataFrame:
+    ensure_db()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, title, created_at_iso FROM saved_plans ORDER BY created_at_iso DESC, id DESC"
+        ).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["id", "title", "created_at_iso"])
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+def list_saved_plans() -> pd.DataFrame:
+    st.session_state.setdefault("db_version", 0)
+    return _list_saved_plans_cached(int(st.session_state["db_version"]))
+
+
+def load_saved_plan(plan_id: int) -> dict:
+    ensure_db()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, title, created_at_iso, payload_json FROM saved_plans WHERE id=?",
+            (int(plan_id),),
+        ).fetchone()
+    if row is None:
+        raise KeyError(f"No saved plan with id={plan_id}")
+    payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
+    payload["_meta"] = {"id": int(row["id"]), "title": row["title"], "created_at_iso": row["created_at_iso"]}
+    return payload
+
+
+def delete_saved_plan(plan_id: int) -> None:
+    ensure_db()
+    with get_conn() as conn:
+        conn.execute("DELETE FROM saved_plans WHERE id=?", (int(plan_id),))
+        conn.commit()
+    bump_db_version()
 
 
 def export_bikes_csv() -> str:
@@ -1320,12 +1409,12 @@ ensure_db()
 df_riders_all = fetch_riders_df()
 df_bikes_all = fetch_bikes_df()
 
-tabs = st.tabs(["Power Plan", "Rider Database", "Bike Database"])
+tabs = st.tabs(["Power Plan", "Saved Plans", "Rider Database", "Bike Database"])
 
 # -----------------------------
 # Bike Database tab
 # -----------------------------
-with tabs[2]:
+with tabs[3]:
     st.header("Bike Database (local SQLite)")
     st.caption("Maintain bikes here. Rider records reference a default bike, but you can override bike choice per plan run.")
 
@@ -1385,7 +1474,7 @@ with tabs[2]:
 # -----------------------------
 # Rider Database tab
 # -----------------------------
-with tabs[1]:
+with tabs[2]:
     st.header("Rider Database (local SQLite)")
     st.caption("Maintain rider anthropometrics and FTP here. Each rider can have a default bike (optional).")
 
@@ -1479,6 +1568,129 @@ with tabs[1]:
             st.success(f"Imported/updated {n_ok} riders.")
             st.session_state["import_riders_key"] = int(st.session_state["import_riders_key"]) + 1
             st.rerun()
+
+# -----------------------------
+# Saved Plans tab
+# -----------------------------
+with tabs[1]:
+    st.header("Saved Plans")
+    st.caption(
+        "Saved plans snapshot rider stats and plan outputs at the time of creation, so later changes to the rider database won't change historical plans."
+    )
+
+    saved_df = list_saved_plans()
+    if saved_df.empty:
+        st.info("No saved plans yet. Generate a plan in the Power Plan tab, then save it.")
+    else:
+        # Human-friendly label
+        saved_df = saved_df.copy()
+        saved_df["label"] = saved_df.apply(
+            lambda r: f"{r['title']}  â  {str(r['created_at_iso']).replace('T',' ').replace('+00:00',' UTC')}",
+            axis=1,
+        )
+
+        sel_label = st.selectbox("Select a saved plan", saved_df["label"].tolist(), key="saved_plan_select")
+        sel_row = saved_df.loc[saved_df["label"] == sel_label].iloc[0]
+        plan_id = int(sel_row["id"])
+
+        payload = load_saved_plan(plan_id)
+        meta = payload.get("_meta", {})
+
+        top = st.columns([3, 1])
+        with top[0]:
+            st.subheader(meta.get("title", "Saved plan"))
+            st.caption(f"Saved: {meta.get('created_at_iso','')}")
+        with top[1]:
+            if st.button("Delete this plan", key="delete_saved_plan"):
+                delete_saved_plan(plan_id)
+                st.success("Deleted.")
+                st.rerun()
+
+        # Display environment / speed
+        env = payload.get("env", {})
+        v_kph = payload.get("v_kph")
+        if v_kph is not None:
+            st.metric("Target speed (km/h)", f"{float(v_kph):.1f}")
+        if env:
+            st.write(
+                {
+                    "effort_method": env.get("effort_method"),
+                    "cap_fraction": env.get("cap_fraction"),
+                    "crr": env.get("crr"),
+                    "rho": env.get("rho"),
+                }
+            )
+
+        # Riders snapshot
+        riders_snap = payload.get("riders_snapshot", [])
+        if riders_snap:
+            st.subheader("Riders (snapshot)")
+            df_rs = pd.DataFrame(riders_snap)
+            # Keep the most relevant columns if present
+            preferred = [
+                "name",
+                "short_name",
+                "height_cm",
+                "weight_kg",
+                "ftp_w",
+                "bike_kg",
+                "cd",
+            ]
+            cols = [c for c in preferred if c in df_rs.columns] + [c for c in df_rs.columns if c not in preferred]
+            st.dataframe(df_rs[cols], width="stretch", hide_index=True)
+
+        # Combined table (authoritative saved output)
+        combined_json = payload.get("combined_table_json")
+        effort_method_label = payload.get("effort_method_label") or "NP"
+        if combined_json:
+            st.subheader("Combined rider plan (saved output)")
+            df_saved = pd.read_json(io.StringIO(combined_json), orient="records")
+            st.dataframe(df_saved, width="stretch", hide_index=True)
+
+            # Power plan card regenerated from saved table
+            st.subheader("Power plan card (export)")
+            required_cols = {
+                "Rider Name",
+                "Front Interval",
+                "Front Power",
+                "Front wkg",
+                "Drafting Avg Power",
+                "Drafting wkg",
+                f"Overall {effort_method_label} Power",
+                f"{effort_method_label} % FTP",
+            }
+            missing = [c for c in required_cols if c not in df_saved.columns]
+            if missing:
+                st.warning(f"Card export unavailable for this saved plan (missing columns: {', '.join(missing)})")
+            else:
+                df_card = pd.DataFrame({
+                    "Rider\nOrder": df_saved["Rider Name"].astype(str),
+                    "Front\nInterval": df_saved["Front Interval"].astype(str),
+                    "Front\nPower": df_saved["Front Power"].astype(int),
+                    "Front\nwkg": df_saved["Front wkg"].astype(float).round(1),
+                    "Drafting\nAvg Power": df_saved["Drafting Avg Power"].astype(int),
+                    "Drafting\nwkg": df_saved["Drafting wkg"].astype(float).round(1),
+                    f"Overall\n{effort_method_label} Power": df_saved[f"Overall {effort_method_label} Power"].astype(int),
+                    f"{effort_method_label}\n% FTP": df_saved[f"{effort_method_label} % FTP"].astype(float).round(1),
+                })
+
+                png_bytes = plan_table_png(df_card)
+                st.image(png_bytes, width="stretch")
+                st.download_button(
+                    "Download power plan card (PNG)",
+                    data=png_bytes,
+                    file_name=f"ttt_power_plan_{plan_id}.png",
+                    mime="image/png",
+                )
+                st.download_button(
+                    "Download power plan table (CSV)",
+                    data=df_card.to_csv(index=False).encode("utf-8"),
+                    file_name=f"ttt_power_plan_{plan_id}.csv",
+                    mime="text/csv",
+                )
+        else:
+            st.warning("This saved plan doesn't contain a stored combined results table.")
+
 
 # -----------------------------
 # Power Plan tab
@@ -1753,6 +1965,59 @@ with tabs[0]:
             file_name="ttt_power_plan.csv",
             mime="text/csv",
         )
+
+    # -----------------------------
+    # Save plan snapshot
+    # -----------------------------
+    st.subheader("Save this plan")
+    st.caption(
+        "Saves the current plan (including any manual pull edits) along with a snapshot of rider stats used to compute it."
+    )
+
+    default_title = f"TTT Plan - {datetime.now().strftime('%d %b %Y')}"
+    save_title = st.text_input("Title", value=default_title, key="save_plan_title")
+
+    pulls_for_save = st.session_state.get("manual_pulls", pulls)
+    combined_for_save = st.session_state.get("combined_table", df_combined)
+
+    if st.button("Save plan snapshot", key="save_plan_btn"):
+        try:
+            riders_snapshot = [
+                {
+                    "name": r.name,
+                    "short_name": r.short_name,
+                    "height_cm": float(r.height_cm),
+                    "weight_kg": float(r.weight_kg),
+                    "ftp_w": float(r.ftp_w),
+                    "bike_kg": float(r.bike_kg),
+                    "cd": float(r.cd),
+                }
+                for r in riders
+            ]
+
+            payload = {
+                "title": save_title.strip(),
+                "created_at_iso": _utc_now_iso(),
+                "v_kph": float(plan.get("v_kph")),
+                "v_mps": float(plan.get("v_mps")),
+                "draft_factors": [float(x) for x in draft_factors],
+                "pulls_s": [float(x) for x in np.asarray(pulls_for_save, dtype=float).tolist()],
+                "env": {
+                    "crr": float(crr),
+                    "rho": float(rho),
+                    "cap_fraction": float(st.session_state["env"].get("cap_fraction")),
+                    "effort_method": str(st.session_state["env"].get("effort_method")),
+                },
+                "effort_method_label": effort_method_label,
+                "riders_snapshot": riders_snapshot,
+                # Authoritative saved output (what you see in the app):
+                "combined_table_json": combined_for_save.to_json(orient="records"),
+            }
+
+            new_id = save_power_plan(save_title, payload)
+            st.success(f"Saved plan (id={new_id}).")
+        except Exception as e:
+            st.error(f"Could not save plan: {e}")
 
     st.subheader("Power required by position (whole numbers)")
     df_pos = build_position_power_table(riders, plan["v_mps"], float(crr), float(rho), draft_factors)
