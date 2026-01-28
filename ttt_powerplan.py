@@ -974,7 +974,20 @@ def ensure_db() -> None:
     raise sqlite3.OperationalError(f"Database is locked (after retries): {last_err}")
 
 
-def fetch_bikes_df() -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def bump_db_version() -> None:
+    """
+    Invalidate cached DB reads after any DB write/import so all tabs
+    immediately reflect the updated database.
+    """
+    st.session_state.setdefault("db_version", 0)
+    st.session_state["db_version"] = int(st.session_state["db_version"]) + 1
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+def _fetch_bikes_df_cached(db_version: int) -> pd.DataFrame:
     ensure_db()
     with get_conn() as conn:
         rows = conn.execute(
@@ -984,6 +997,11 @@ def fetch_bikes_df() -> pd.DataFrame:
         return pd.DataFrame(columns=["id", "name", "bike_kg", "cd"])
     return pd.DataFrame([dict(r) for r in rows])
 
+
+def fetch_bikes_df() -> pd.DataFrame:
+    # db_version busts cache after any DB write/import
+    st.session_state.setdefault("db_version", 0)
+    return _fetch_bikes_df_cached(int(st.session_state["db_version"]))
 
 def upsert_bike(name: str, bike_kg: float, cd: float) -> None:
     ensure_db()
@@ -999,6 +1017,7 @@ def upsert_bike(name: str, bike_kg: float, cd: float) -> None:
             (name.strip(), float(bike_kg), float(cd)),
         )
         conn.commit()
+        bump_db_version()
 
 
 def delete_bike_by_name(name: str) -> None:
@@ -1010,9 +1029,11 @@ def delete_bike_by_name(name: str) -> None:
             return
         conn.execute("DELETE FROM bikes WHERE name=?", (name.strip(),))
         conn.commit()
+        bump_db_version()
 
 
-def fetch_riders_df() -> pd.DataFrame:
+@st.cache_data(show_spinner=False)
+def _fetch_riders_df_cached(db_version: int) -> pd.DataFrame:
     ensure_db()
     with get_conn() as conn:
         rows = conn.execute(
@@ -1029,12 +1050,16 @@ def fetch_riders_df() -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(
             columns=[
-                "id","name","height_cm","weight_kg","ftp_w",
+                "id","name","short_name","height_cm","weight_kg","p20_w","ftp_w","effective_max_hr","strava_url","zwiftpower_url",
                 "default_bike_id","default_bike_name","default_bike_kg","default_bike_cd"
             ]
         )
     return pd.DataFrame([dict(r) for r in rows])
 
+
+def fetch_riders_df() -> pd.DataFrame:
+    st.session_state.setdefault("db_version", 0)
+    return _fetch_riders_df_cached(int(st.session_state["db_version"]))
 
 def upsert_rider(
     name: str,
@@ -1083,6 +1108,7 @@ def upsert_rider(
             ),
         )
         conn.commit()
+        bump_db_version()
 
 
 def delete_rider_by_name(name: str) -> None:
@@ -1090,6 +1116,7 @@ def delete_rider_by_name(name: str) -> None:
     with get_conn() as conn:
         conn.execute("DELETE FROM riders WHERE name=?", (name.strip(),))
         conn.commit()
+        bump_db_version()
 
 
 def export_bikes_csv() -> str:
@@ -1448,7 +1475,7 @@ with tabs[0]:
     with st.sidebar:
         st.subheader("Environment / Model")
         crr = st.number_input("CRR", value=0.004, step=0.0005, format="%.4f")
-        rho = st.number_input("Air density ÃÂÃÂÃÂÃÂ (kg/mÃÂÃÂÃÂÃÂ³)", value=1.214, step=0.01, format="%.3f")
+        rho = st.number_input("Air density ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ (kg/mÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ³)", value=1.214, step=0.01, format="%.3f")
 
         st.subheader("Constraints")
         effort_method = st.selectbox("Effort metric (constraint & reporting)", ["NP", "XP", "Average"], index=0)
@@ -1482,7 +1509,7 @@ with tabs[0]:
 
     st.subheader("Select riders for this plan")
     selected_names = st.multiselect(
-        "Pick riders (4ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ8). You can edit values temporarily below before solving.",
+        "Pick riders (4ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ8). You can edit values temporarily below before solving.",
         options=riders_df["name"].tolist(),
         default=riders_df["name"].tolist()[:4],
     )
@@ -1553,7 +1580,7 @@ with tabs[0]:
     sel_edit["__order_score_v"] = sel_edit.apply(_solve_front_speed_mps, axis=1)
     sel_edit = sel_edit.sort_values("__order_score_v", ascending=False).drop(columns="__order_score_v").reset_index(drop=True)
 
-    st.caption("Rider order is enforced strongest ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ weakest (based on cap-speed proxy using FTP, CdA, and mass).")
+    st.caption("Rider order is enforced strongest ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ weakest (based on cap-speed proxy using FTP, CdA, and mass).")
     st.dataframe(sel_edit[["name","short_name","height_cm","weight_kg","ftp_w","Bike","Bike_kg","Cd"]], width="stretch", hide_index=True)
 
     # Draft model editor (default rules; for N>4 positions beyond 4 default to pos4 factor)
