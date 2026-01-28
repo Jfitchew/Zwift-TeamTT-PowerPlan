@@ -1,3 +1,4 @@
+# ttt_powerplan.py
 # Streamlit app: Zwift TTT pull & power planner + local rider database (SQLite)
 #
 # Run:
@@ -1331,7 +1332,7 @@ with tabs[2]:
     st.dataframe(fetch_bikes_df().assign(
         bike_kg=lambda d: d["bike_kg"].round(3),
         cd=lambda d: d["cd"].round(4),
-    ), use_container_width=True, hide_index=True)
+    ), width="stretch", hide_index=True)
 
     st.subheader("Import / Export bikes (CSV)")
     exp = export_bikes_csv()
@@ -1415,7 +1416,7 @@ with tabs[1]:
         show["weight_kg"] = show["weight_kg"].round(1)
         show["ftp_w"] = show["ftp_w"].round(0).astype(int)
         show["default_bike_name"] = show["default_bike_name"].fillna(default_bike_name)
-        st.dataframe(show[["name","height_cm","weight_kg","ftp_w","default_bike_name"]], use_container_width=True, hide_index=True)
+        st.dataframe(show[["name","height_cm","weight_kg","ftp_w","default_bike_name"]], width="stretch", hide_index=True)
 
     st.subheader("Import / Export riders (CSV / XLSX)")
     exp = export_riders_csv()
@@ -1511,7 +1512,7 @@ with tabs[0]:
     sel_edit = st.data_editor(
         sel[["name","short_name","height_cm","weight_kg","p20_w","ftp_w","Bike","Bike_kg","Cd"]],
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "name": st.column_config.TextColumn("Rider", disabled=True),
             "short_name": st.column_config.TextColumn("Short", disabled=False),
@@ -1553,13 +1554,13 @@ with tabs[0]:
     sel_edit = sel_edit.sort_values("__order_score_v", ascending=False).drop(columns="__order_score_v").reset_index(drop=True)
 
     st.caption("Rider order is enforced strongest ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ weakest (based on cap-speed proxy using FTP, CdA, and mass).")
-    st.dataframe(sel_edit[["name","short_name","height_cm","weight_kg","ftp_w","Bike","Bike_kg","Cd"]], use_container_width=True, hide_index=True)
+    st.dataframe(sel_edit[["name","short_name","height_cm","weight_kg","ftp_w","Bike","Bike_kg","Cd"]], width="stretch", hide_index=True)
 
     # Draft model editor (default rules; for N>4 positions beyond 4 default to pos4 factor)
     st.subheader("Draft model (CdA factors by position)")
     draft_defaults = build_default_draft_factors(len(sel_edit))
     draft_df = pd.DataFrame({"Position": list(range(1, len(sel_edit)+1)), "CdA factor": draft_defaults})
-    draft_df = st.data_editor(draft_df, use_container_width=True, hide_index=True, key="draft_df")
+    draft_df = st.data_editor(draft_df, width="stretch", hide_index=True, key="draft_df")
     draft_factors = [float(x) for x in draft_df["CdA factor"].tolist()]
 
     # Build Rider objects for solver
@@ -1625,7 +1626,7 @@ with tabs[0]:
 
     st.subheader("Combined rider plan (starting order)")
     df_combined = build_combined_results_table(riders, pulls, P, avgW, effortW, effort_method)
-    st.dataframe(df_combined, use_container_width=True, hide_index=True)
+    st.dataframe(df_combined, width="stretch", hide_index=True)
 
     # Presentation table (matches your preferred layout) + PNG export
     st.subheader("Power plan card (export)")
@@ -1662,7 +1663,7 @@ with tabs[0]:
 
         png_bytes = plan_table_png(df_card)
 
-        st.image(png_bytes, use_container_width=True)
+        st.image(png_bytes, width="stretch")
         st.download_button(
             "Download power plan card (PNG)",
             data=png_bytes,
@@ -1687,7 +1688,7 @@ with tabs[0]:
     manual_edit = st.data_editor(
         manual_df,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Rider": st.column_config.TextColumn(disabled=True),
             "Pull_s": st.column_config.NumberColumn(step=1, format="%d"),
@@ -1711,8 +1712,8 @@ with tabs[0]:
 
     if "combined_table" in st.session_state and "manual_pulls" in st.session_state:
         st.subheader("Combined rider plan (after manual pull edits)")
-        st.dataframe(st.session_state["combined_table"], use_container_width=True, hide_index=True)
+        st.dataframe(st.session_state["combined_table"], width="stretch", hide_index=True)
 
     st.subheader("Power required by position (whole numbers)")
     df_pos = build_position_power_table(riders, plan["v_mps"], float(crr), float(rho), draft_factors)
-    st.dataframe(df_pos, use_container_width=True, hide_index=True)
+    st.dataframe(df_pos, width="stretch", hide_index=True)
