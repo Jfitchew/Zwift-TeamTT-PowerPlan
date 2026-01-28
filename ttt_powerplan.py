@@ -974,7 +974,6 @@ def ensure_db() -> None:
     raise sqlite3.OperationalError(f"Database is locked (after retries): {last_err}")
 
 
-@st.cache_data(show_spinner=False)
 def bump_db_version() -> None:
     """
     Invalidate cached DB reads after any DB write/import so all tabs
@@ -987,6 +986,8 @@ def bump_db_version() -> None:
     except Exception:
         pass
 
+
+@st.cache_data(show_spinner=False)
 def _fetch_bikes_df_cached(db_version: int) -> pd.DataFrame:
     ensure_db()
     with get_conn() as conn:
@@ -1365,17 +1366,21 @@ with tabs[2]:
     exp = export_bikes_csv()
     st.download_button("Download bikes.csv", data=exp, file_name="bikes.csv", mime="text/csv")
 
-    up = st.file_uploader("Import bikes.csv", type=["csv"], key="import_bikes")
+    # Streamlit reruns the script frequently; avoid re-importing on every rerun by gating with a button and a changing key.
+    st.session_state.setdefault("import_bikes_key", 0)
+    up = st.file_uploader("Select bikes.csv to import", type=["csv"], key=f"import_bikes_{st.session_state['import_bikes_key']}")
     if up is not None:
-        n_ok, errors = import_bikes_csv(up.read())
-        if errors:
-            st.warning("Imported with some issues:")
-            for e in errors[:10]:
-                st.write(f"- {e}")
-            if len(errors) > 10:
-                st.write(f"...and {len(errors)-10} more.")
-        st.success(f"Imported/updated {n_ok} bikes.")
-        st.rerun()
+        if st.button("Import / update bikes", key="do_import_bikes"):
+            n_ok, errors = import_bikes_csv(up.getvalue())
+            if errors:
+                st.warning("Imported with some issues:")
+                for e in errors[:10]:
+                    st.write(f"- {e}")
+                if len(errors) > 10:
+                    st.write(f"...and {len(errors)-10} more.")
+            st.success(f"Imported/updated {n_ok} bikes.")
+            st.session_state["import_bikes_key"] = int(st.session_state["import_bikes_key"]) + 1
+            st.rerun()
 
 # -----------------------------
 # Rider Database tab
@@ -1449,22 +1454,31 @@ with tabs[1]:
     exp = export_riders_csv()
     st.download_button("Download riders.csv", data=exp, file_name="riders.csv", mime="text/csv")
 
-    up = st.file_uploader("Import riders file", type=["csv", "xlsx"], key="import_riders")
+    # Gate import with a button so a rerun doesn't repeatedly re-import the same uploaded file.
+    st.session_state.setdefault("import_riders_key", 0)
+    up = st.file_uploader(
+        "Select riders file to import",
+        type=["csv", "xlsx"],
+        key=f"import_riders_{st.session_state['import_riders_key']}",
+    )
     if up is not None:
-        fn = (up.name or "").lower()
-        if fn.endswith(".xlsx"):
-            n_ok, errors = import_riders_xlsx(up.read())
-        else:
-            n_ok, errors = import_riders_csv(up.read())
+        if st.button("Import / update riders", key="do_import_riders"):
+            fn = (up.name or "").lower()
+            data = up.getvalue()
+            if fn.endswith(".xlsx"):
+                n_ok, errors = import_riders_xlsx(data)
+            else:
+                n_ok, errors = import_riders_csv(data)
 
-        if errors:
-            st.warning("Imported with some issues:")
-            for e in errors[:10]:
-                st.write(f"- {e}")
-            if len(errors) > 10:
-                st.write(f"...and {len(errors)-10} more.")
-        st.success(f"Imported/updated {n_ok} riders.")
-        st.rerun()
+            if errors:
+                st.warning("Imported with some issues:")
+                for e in errors[:10]:
+                    st.write(f"- {e}")
+                if len(errors) > 10:
+                    st.write(f"...and {len(errors)-10} more.")
+            st.success(f"Imported/updated {n_ok} riders.")
+            st.session_state["import_riders_key"] = int(st.session_state["import_riders_key"]) + 1
+            st.rerun()
 
 # -----------------------------
 # Power Plan tab
@@ -1475,7 +1489,7 @@ with tabs[0]:
     with st.sidebar:
         st.subheader("Environment / Model")
         crr = st.number_input("CRR", value=0.004, step=0.0005, format="%.4f")
-        rho = st.number_input("Air density ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ (kg/mÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ³)", value=1.214, step=0.01, format="%.3f")
+        rho = st.number_input("Air density ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ (kg/mÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ³)", value=1.214, step=0.01, format="%.3f")
 
         st.subheader("Constraints")
         effort_method = st.selectbox("Effort metric (constraint & reporting)", ["NP", "XP", "Average"], index=0)
@@ -1509,7 +1523,7 @@ with tabs[0]:
 
     st.subheader("Select riders for this plan")
     selected_names = st.multiselect(
-        "Pick riders (4ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ8). You can edit values temporarily below before solving.",
+        "Pick riders (4ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ8). You can edit values temporarily below before solving.",
         options=riders_df["name"].tolist(),
         default=riders_df["name"].tolist()[:4],
     )
@@ -1580,7 +1594,7 @@ with tabs[0]:
     sel_edit["__order_score_v"] = sel_edit.apply(_solve_front_speed_mps, axis=1)
     sel_edit = sel_edit.sort_values("__order_score_v", ascending=False).drop(columns="__order_score_v").reset_index(drop=True)
 
-    st.caption("Rider order is enforced strongest ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ weakest (based on cap-speed proxy using FTP, CdA, and mass).")
+    st.caption("Rider order is enforced strongest ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ weakest (based on cap-speed proxy using FTP, CdA, and mass).")
     st.dataframe(sel_edit[["name","short_name","height_cm","weight_kg","ftp_w","Bike","Bike_kg","Cd"]], width="stretch", hide_index=True)
 
     # Draft model editor (default rules; for N>4 positions beyond 4 default to pos4 factor)
@@ -1655,56 +1669,6 @@ with tabs[0]:
     df_combined = build_combined_results_table(riders, pulls, P, avgW, effortW, effort_method)
     st.dataframe(df_combined, width="stretch", hide_index=True)
 
-    # Presentation table (matches your preferred layout) + PNG export
-    st.subheader("Power plan card (export)")
-    st.caption("This is a compact, shareable table view (PNG), using the current pulls (manual edits included if applied).")
-
-    df_for_card = df_combined
-    if "combined_table" in st.session_state and "manual_pulls" in st.session_state:
-        df_for_card = st.session_state["combined_table"]
-
-    # Build card-style table
-    # Expect df_for_card has columns: Rider, Pull_s, Pull_W, DraftAvg_W, and NP_W/XP_W + NP_%FTP/XP_%FTP
-    effort_col_w = None
-    effort_col_pct = None
-    for c in df_for_card.columns:
-        if c.endswith("_W") and c not in ("Avg_W", "Pull_W", "DraftAvg_W"):
-            effort_col_w = c
-        if c.endswith("_%FTP"):
-            effort_col_pct = c
-
-    if effort_col_w is None or effort_col_pct is None:
-        st.warning("Card export unavailable: could not find effort columns in the combined table.")
-    else:
-        effort_method_label = {"NP":"NP","XP":"XP","Average":"Avg"}.get(effort_method, str(effort_method))
-        df_card = pd.DataFrame({
-            "Rider\nOrder": df_for_card["Rider Name"].astype(str),
-            "Front\nInterval": df_for_card["Front Interval"].astype(str),
-            "Front\nPower": df_for_card["Front Power"].astype(int),
-            "Front\nwkg": df_for_card["Front wkg"].astype(float).round(1),
-            "Drafting\nAvg Power": df_for_card["Drafting Avg Power"].astype(int),
-            "Drafting\nwkg": df_for_card["Drafting wkg"].astype(float).round(1),
-            f"Overall\\n{effort_method_label} Power": df_for_card[f"Overall {effort_method_label} Power"].astype(int),
-            f"{effort_method_label}\\n% FTP": df_for_card[f"{effort_method_label} % FTP"].astype(float).round(1),
-        })
-
-        png_bytes = plan_table_png(df_card)
-
-        st.image(png_bytes, width="stretch")
-        st.download_button(
-            "Download power plan card (PNG)",
-            data=png_bytes,
-            file_name="ttt_power_plan.png",
-            mime="image/png",
-        )
-        st.download_button(
-            "Download power plan table (CSV)",
-            data=df_card.to_csv(index=False).encode("utf-8"),
-            file_name="ttt_power_plan.csv",
-            mime="text/csv",
-        )
-
-
     # Manual pull adjustment
     st.subheader("Manually adjust pull durations (recalculate %FTP etc.)")
     st.caption("Edits keep the same target speed; the combined table updates to reflect new duty shares.")
@@ -1740,6 +1704,55 @@ with tabs[0]:
     if "combined_table" in st.session_state and "manual_pulls" in st.session_state:
         st.subheader("Combined rider plan (after manual pull edits)")
         st.dataframe(st.session_state["combined_table"], width="stretch", hide_index=True)
+
+    # Presentation table (matches your preferred layout) + PNG export
+    st.subheader("Power plan card (export)")
+    st.caption("This is a compact, shareable table view (PNG) that reflects the *current* pull durations (including any manual edits).")
+
+    # Prefer the manually-adjusted table if present; otherwise use the solver output.
+    df_for_card = st.session_state.get("combined_table", df_combined)
+
+    effort_method_label = {"NP": "NP", "XP": "XP", "Average": "Avg"}.get(effort_method, str(effort_method))
+    required_cols = {
+        "Rider Name",
+        "Front Interval",
+        "Front Power",
+        "Front wkg",
+        "Drafting Avg Power",
+        "Drafting wkg",
+        f"Overall {effort_method_label} Power",
+        f"{effort_method_label} % FTP",
+    }
+
+    missing = [c for c in required_cols if c not in df_for_card.columns]
+    if missing:
+        st.warning(f"Card export unavailable: missing columns: {', '.join(missing)}")
+    else:
+        df_card = pd.DataFrame({
+            "Rider\nOrder": df_for_card["Rider Name"].astype(str),
+            "Front\nInterval": df_for_card["Front Interval"].astype(str),
+            "Front\nPower": df_for_card["Front Power"].astype(int),
+            "Front\nwkg": df_for_card["Front wkg"].astype(float).round(1),
+            "Drafting\nAvg Power": df_for_card["Drafting Avg Power"].astype(int),
+            "Drafting\nwkg": df_for_card["Drafting wkg"].astype(float).round(1),
+            f"Overall\n{effort_method_label} Power": df_for_card[f"Overall {effort_method_label} Power"].astype(int),
+            f"{effort_method_label}\n% FTP": df_for_card[f"{effort_method_label} % FTP"].astype(float).round(1),
+        })
+
+        png_bytes = plan_table_png(df_card)
+        st.image(png_bytes, width="stretch")
+        st.download_button(
+            "Download power plan card (PNG)",
+            data=png_bytes,
+            file_name="ttt_power_plan.png",
+            mime="image/png",
+        )
+        st.download_button(
+            "Download power plan table (CSV)",
+            data=df_card.to_csv(index=False).encode("utf-8"),
+            file_name="ttt_power_plan.csv",
+            mime="text/csv",
+        )
 
     st.subheader("Power required by position (whole numbers)")
     df_pos = build_position_power_table(riders, plan["v_mps"], float(crr), float(rho), draft_factors)
